@@ -6,31 +6,31 @@ from openai import OpenAI
 from flask import Flask
 from threading import Thread
 
-# ====== Secrets ======
+# ====== Secrets / Env ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_KEY     = os.getenv("OPENAI_API_KEY")
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets")
+    raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets/Env")
 if not OPENAI_KEY:
-    raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
+    raise RuntimeError("Нет OPENAI_API_KEY в Secrets/Env")
 
-# OpenAI client
+# ====== OpenAI client ======
 client = OpenAI(api_key=OPENAI_KEY)
 
 # ====== Logging ======
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# Remove webhook (safety)
+# ====== Safety: remove webhook if any ======
 try:
     bot.remove_webhook()
     logging.info("Webhook removed (ok)")
 except Exception as e:
     logging.warning(f"Webhook remove warn: {e}")
 
-# ====== Memory ======
-history = {}           # uid -> [{"role":"user"/"assistant","content":"..."}]
-HARD_LIMIT = 24
+# ====== Simple in-memory history ======
+history = {}      # uid -> [{"role": "user"/"assistant", "content": "..."}]
+HARD_LIMIT = 24   # cap context length
 
 def _trim(msgs):
     if len(msgs) > HARD_LIMIT:
@@ -59,17 +59,20 @@ def send_long(chat_id: int, text: str):
     for i in range(0, len(text), MAX):
         bot.send_message(chat_id, text[i:i+MAX])
 
-# --- helper: detect commands reliably (via entities) ---
+# --- helper: detect commands robustly ---
 def is_command_msg(m) -> bool:
+    # 1) via entities (at any position)
     try:
         if m.entities:
             for e in m.entities:
-                if getattr(e, "type", "") == "bot_command" and getattr(e, "offset", 0) == 0:
+                if getattr(e, "type", "") == "bot_command":
                     return True
     except Exception:
         pass
+    # 2) via text — ignore leading spaces/zero-widths around "/"
     t = (m.text or "")
-    return t.startswith("/")
+    t_stripped = t.lstrip()
+    return t_stripped.startswith("/")
 
 # ====== Commands ======
 @bot.message_handler(commands=['start'])
@@ -91,7 +94,7 @@ def cmd_start(m):
 @bot.message_handler(commands=['ping'])
 def cmd_ping(m):
     bot.send_message(m.chat.id, "pong ✅")
-    return  # do not fall through
+    return  # не пропускаем дальше
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(m):
@@ -113,19 +116,19 @@ def on_buttons(m):
     send_long(m.chat.id, reply)
     return
 
-# ====== Generic text (never handle commands) ======
+# ====== Any text (NEVER handle commands) ======
 @bot.message_handler(content_types=['text'], func=lambda m: (m.text or "") and not is_command_msg(m))
 def on_text(m):
     uid = m.from_user.id
     reply = ask_gpt(uid, m.text or "")
     send_long(m.chat.id, reply)
 
-# ====== Keep-alive server ======
+# ====== Keep-alive Flask server for Render/UptimeRobot ======
 app = Flask(__name__)
 
 @app.get("/")
 def root():
-    return "OK v3", 200  # bump version to verify deploy
+    return "OK v4", 200   # пометка версии для проверки деплоя
 
 @app.get("/health")
 def health():
