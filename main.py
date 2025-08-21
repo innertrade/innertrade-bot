@@ -7,14 +7,14 @@ from telebot import types
 from openai import OpenAI  # новый SDK
 from flask import Flask
 
-# ====== Ключи из Secrets ======
+# ====== Ключи из Secrets/Env ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_KEY    = os.getenv("OPENAI_API_KEY")
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets")
+    raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets/Env")
 if not OPENAI_KEY:
-    raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
+    raise RuntimeError("Нет OPENAI_API_KEY в Secrets/Env")
 
 # ====== OpenAI client ======
 client = OpenAI(api_key=OPENAI_KEY)
@@ -23,7 +23,7 @@ client = OpenAI(api_key=OPENAI_KEY)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# ====== Снять webhook на всякий случай ======
+# ====== Снять webhook на всякий случай (если перезапускали) ======
 try:
     bot.remove_webhook()
     logging.info("Webhook removed (ok)")
@@ -31,8 +31,8 @@ except Exception as e:
     logging.warning(f"Webhook remove warn: {e}")
 
 # ====== Память диалога ======
-history = {}            # uid -> [{"role":"user"/"assistant","content":"..."}]
-HARD_LIMIT_MSGS = 24    # ограничим длину контекста
+history = {}          # uid -> [{"role":"user"/"assistant","content":"..."}]
+HARD_LIMIT_MSGS = 24  # ограничим длину контекста
 
 def _trim(msgs):
     if len(msgs) > HARD_LIMIT_MSGS:
@@ -74,20 +74,23 @@ def cmd_start(m):
     kb.row(types.KeyboardButton("Чек-лист"), types.KeyboardButton("Фиксация"), types.KeyboardButton("Сброс"))
     bot.send_message(
         m.chat.id,
-        "👋 Привет! Я ИИ-наставник InnerTrade.\n"
+        "👋 Привет! Я ИИ-наставник Innertrade.\n"
         "Выбери кнопку или напиши текст.\n"
         "Команды: /ping /reset",
         reply_markup=kb
     )
+    return  # не пропускаем дальше
 
 @bot.message_handler(commands=['ping'])
 def cmd_ping(m):
     bot.send_message(m.chat.id, "pong ✅")
+    return  # <--- важно: после /ping ничего больше не делаем
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(m):
     history[m.from_user.id] = []
     bot.send_message(m.chat.id, "Контекст очищен.")
+    return
 
 # ====== Кнопки ======
 @bot.message_handler(func=lambda x: x.text in {"Модуль 1","Модуль 2","Чек-лист","Фиксация","Сброс"})
@@ -108,15 +111,19 @@ def on_buttons(m):
     }
     reply = ask_gpt(uid, alias.get(t, t))
     send_long(m.chat.id, reply)
+    return
 
-# ====== Любой текст ======
-@bot.message_handler(func=lambda _: True)
+# ====== Любой текст (кроме команд) ======
+@bot.message_handler(func=lambda m: True)
 def on_text(m):
+    # Игнорируем команды (чтобы /ping и др. не попадали сюда)
+    if m.text and m.text.startswith("/"):
+        return
     uid = m.from_user.id
     reply = ask_gpt(uid, m.text or "")
     send_long(m.chat.id, reply)
 
-# ====== Мини-вебсервер для keep-alive ======
+# ====== Мини-веб-сервер для keep-alive ======
 app = Flask(__name__)
 
 @app.get("/")
