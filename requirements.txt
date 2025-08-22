@@ -2,4 +2,4 @@ pyTelegramBotAPI==4.15.4
 openai>=1.100.0
 Flask==3.1.2
 SQLAlchemy==2.0.32
-psycopg2-binary==2.9.9
+psycopg[binary]==3.2.9
