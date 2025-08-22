@@ -1,216 +1,488 @@
-# ===== main.py (Innertrade mentor bot) =====
+# main.py (v5) — Innertrade bot with DB memory (Passport / Errors / WeeklyPanel / Progress)
+
 import os
 import logging
+from datetime import datetime, date
+from typing import Optional, List
+
 from flask import Flask
 import telebot
 from telebot import types
+
 from openai import OpenAI
 
-# ---------- ENV ----------
+from sqlalchemy import (
+    create_engine, Integer, String, DateTime, Date, Text, ForeignKey, func
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+
+# ==== ENV & Clients ====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-PORT = int(os.getenv("PORT", "10000"))
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_TOKEN в Env")
+    raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets")
 if not OPENAI_KEY:
-    raise RuntimeError("Нет OPENAI_API_KEY в Env")
+    raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
+if not DATABASE_URL:
+    raise RuntimeError("Нет DATABASE_URL в Secrets")
 
-# ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ---------- GPT ----------
+bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 client = OpenAI(api_key=OPENAI_KEY)
 
-# Храним контексты по пользователю
-history = {}  # uid -> [{"role":"system"/"user"/"assistant","content":"..."}]
+# ==== DB setup ====
+class Base(DeclarativeBase): pass
 
-SYSTEM_PROMPT = (
-    "Ты — ИИ-наставник проекта Innertrade. "
-    "Твоя задача: быстро определить запрос пользователя и вести его по коротким шагам. "
-    "Отвечай структурировано, короткими блоками, с буллетами и мини-чеклистами. "
-    "Если пользователь жмёт кнопку-интент, продолжай как сценарий: задай 1–2 уточняющих вопроса, "
-    "дай готовый шаг и микрорезультат для фиксации. Не уходи в длинные лекции."
-)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
-def get_msgs(uid):
-    msgs = history.setdefault(uid, [])
-    # добавим System один раз
-    if not msgs or msgs[0].get("role") != "system":
-        msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-    return msgs
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tg_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    first_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
-def ask_gpt(uid, text):
-    msgs = get_msgs(uid)
-    msgs.append({"role": "user", "content": text})
+    passport: Mapped["Passport"] = relationship(back_populates="user", uselist=False)
+    errors: Mapped[List["ErrorLog"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    weeks: Mapped[List["WeeklyPanel"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    progress: Mapped[List["Progress"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+class Passport(Base):
+    __tablename__ = "passport"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    # ключевые поля из курса
+    trading_style: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)   # скальп/интрадей/свинг
+    timeframe_pref: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)  # M1/M5/M15/H1 и т.п.
+    instruments: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)    # тикеры/рынки
+    risk_profile: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)   # консерват/умеренный/агрессивный
+    archetypes: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)     # текстом
+    subparts: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)       # субличности/роли (кратко)
+    triggers: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)       # личные триггеры
+    rituals: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)        # ключевые ритуалы
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+
+    user: Mapped["User"] = relationship(back_populates="passport")
+
+class ErrorLog(Base):
+    __tablename__ = "error_log"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    # MERCEDES краткая фиксация
+    error_text: Mapped[str] = mapped_column(Text)             # формулировка ошибки
+    emotions: Mapped[Optional[str]] = mapped_column(Text)     # E
+    thoughts: Mapped[Optional[str]] = mapped_column(Text)     # M
+    behavior: Mapped[Optional[str]] = mapped_column(Text)     # B
+    beliefs: Mapped[Optional[str]] = mapped_column(Text)      # Убеждения/ценности
+    context: Mapped[Optional[str]] = mapped_column(Text)      # Контекст
+    pattern: Mapped[Optional[str]] = mapped_column(Text)      # повторяющийся паттерн
+    goal: Mapped[Optional[str]] = mapped_column(Text)         # позитивная цель
+    tote_steps: Mapped[Optional[str]] = mapped_column(Text)   # шаги по TOTE (кратко)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+    user: Mapped["User"] = relationship(back_populates="errors")
+
+class WeeklyPanel(Base):
+    __tablename__ = "weekly_panel"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    week_start: Mapped[date] = mapped_column(Date)
+    focus_node: Mapped[Optional[str]] = mapped_column(String(120))  # узел ТС недели (напр., «Выход», «Риск»)
+    plan: Mapped[Optional[str]] = mapped_column(Text)               # краткий план
+    limits: Mapped[Optional[str]] = mapped_column(Text)             # дневные/недельные лимиты
+    retro: Mapped[Optional[str]] = mapped_column(Text)              # ретроспектива
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+
+    user: Mapped["User"] = relationship(back_populates="weeks")
+
+class Progress(Base):
+    __tablename__ = "progress"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    module: Mapped[Optional[str]] = mapped_column(String(40))  # M1/M2/Generic
+    lesson: Mapped[Optional[str]] = mapped_column(String(40))  # L1/L2/L3/L4
+    status: Mapped[Optional[str]] = mapped_column(String(40))  # started/done/paused
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+
+    user: Mapped["User"] = relationship(back_populates="progress")
+
+Base.metadata.create_all(bind=engine)
+
+# ==== Helpers ====
+def db() -> SessionLocal:
+    return SessionLocal()
+
+def get_or_create_user(tg_id: int, username: Optional[str], first_name: Optional[str]) -> User:
+    s = db()
+    try:
+        u = s.query(User).filter(User.tg_id == tg_id).one_or_none()
+        if u is None:
+            u = User(tg_id=tg_id, username=username, first_name=first_name)
+            s.add(u)
+            s.commit()
+            s.refresh(u)
+        return u
+    finally:
+        s.close()
+
+def get_passport(u: User) -> Optional[Passport]:
+    s = db()
+    try:
+        return s.query(Passport).filter(Passport.user_id == u.id).one_or_none()
+    finally:
+        s.close()
+
+def upsert_passport(u: User, **kwargs):
+    s = db()
+    try:
+        p = s.query(Passport).filter(Passport.user_id == u.id).one_or_none()
+        if p is None:
+            p = Passport(user_id=u.id, **kwargs)
+            s.add(p)
+        else:
+            for k, v in kwargs.items():
+                setattr(p, k, v)
+        s.commit()
+    finally:
+        s.close()
+
+def add_error(u: User, **kwargs):
+    s = db()
+    try:
+        e = ErrorLog(user_id=u.id, **kwargs)
+        s.add(e)
+        s.commit()
+    finally:
+        s.close()
+
+def list_errors(u: User, limit=5) -> List[ErrorLog]:
+    s = db()
+    try:
+        return (
+            s.query(ErrorLog)
+            .filter(ErrorLog.user_id == u.id)
+            .order_by(ErrorLog.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+    finally:
+        s.close()
+
+def upsert_week(u: User, week_start: date, **kwargs):
+    s = db()
+    try:
+        w = (
+            s.query(WeeklyPanel)
+            .filter(WeeklyPanel.user_id == u.id, WeeklyPanel.week_start == week_start)
+            .one_or_none()
+        )
+        if w is None:
+            w = WeeklyPanel(user_id=u.id, week_start=week_start, **kwargs)
+            s.add(w)
+        else:
+            for k, v in kwargs.items():
+                setattr(w, k, v)
+        s.commit()
+    finally:
+        s.close()
+
+def get_latest_week(u: User) -> Optional[WeeklyPanel]:
+    s = db()
+    try:
+        return (
+            s.query(WeeklyPanel)
+            .filter(WeeklyPanel.user_id == u.id)
+            .order_by(WeeklyPanel.week_start.desc())
+            .first()
+        )
+    finally:
+        s.close()
+
+def add_progress(u: User, module: str, lesson: str, status: str, note: Optional[str] = None):
+    s = db()
+    try:
+        p = Progress(user_id=u.id, module=module, lesson=lesson, status=status, note=note)
+        s.add(p)
+        s.commit()
+    finally:
+        s.close()
+
+# ==== System Prompt (динамический) ====
+def build_system_prompt(u: User) -> str:
+    p = get_passport(u)
+    last_errors = list_errors(u, limit=3)
+
+    # Базовая «прошивка» курса для бота (кратко, хватает для ориентиров и терминов)
+    core = (
+        "Ты — ИИ-наставник Innertrade. Помогаешь трейдеру через:\n"
+        "- Модуль 1 (психология): Mercedes (эмоции/мысли/поведение/убеждения/контекст) и TOTE; архетипы/роли/субличности; убеждения/ценности; интеграционная карта.\n"
+        "- Модуль 2 (ТС): стиль, ТФ, вход, сопровождение, выход, риск, аварийный план, торговый план.\n"
+        "Правило ответов: кратко, по шагам, с чек-листами. Всегда персонализируй под паспорт и последние ошибки.\n"
+    )
+
+    # Вставка персональных данных
+    passport_txt = ""
+    if p:
+        passport_txt = (
+            f"[ПАСПОРТ]\n"
+            f"Стиль: {p.trading_style or '-'}; ТФ: {p.timeframe_pref or '-'}; Инструменты: {p.instruments or '-'};\n"
+            f"Риск-профиль: {p.risk_profile or '-'}; Архетипы: {p.archetypes or '-'};\n"
+            f"Субличности/роли: {p.subparts or '-'}; Триггеры: {p.triggers or '-'}; Ритуалы: {p.rituals or '-'}.\n"
+        )
+    errors_txt = ""
+    if last_errors:
+        bullets = []
+        for e in last_errors:
+            bullets.append(f"• {e.error_text} | паттерн: {e.pattern or '-'} | цель: {e.goal or '-'}")
+        errors_txt = "[ПОСЛЕДНИЕ ОШИБКИ]\n" + "\n".join(bullets) + "\n"
+
+    return core + passport_txt + errors_txt
+
+def ask_gpt_with_context(u: User, user_text: str) -> str:
+    system_prompt = build_system_prompt(u)
+    msgs = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text}
+    ]
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.5,
+        temperature=0.4,
         messages=msgs
     )
-    reply = (resp.choices[0].message.content or "").strip()
-    msgs.append({"role": "assistant", "content": reply})
-    return reply
+    return (resp.choices[0].message.content or "").strip()
 
-# ---------- BOT ----------
-bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+# ==== Flask keepalive ====
+app = Flask(__name__)
 
-# Снять вебхук (на всякий)
+@app.route("/", methods=["GET"])
+def root():
+    return "Innertrade bot OK"
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "pong"
+
+# ==== Telegram Handlers ====
+def main_menu() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(types.KeyboardButton("🧭 У меня ошибка"), types.KeyboardButton("🧩 Хочу стратегию"))
+    kb.row(types.KeyboardButton("🗓 Панель недели"), types.KeyboardButton("🪪 Паспорт"))
+    kb.row(types.KeyboardButton("📈 Мой прогресс"), types.KeyboardButton("🧰 Материалы"))
+    kb.row(types.KeyboardButton("🔁 Сброс"))
+    return kb
+
+def send(msg, text):
+    # Без reply_to (чтобы не цеплялся к сообщению пользователя)
+    bot.send_message(msg.chat.id, text)
+
+@bot.message_handler(commands=['start'])
+def cmd_start(m):
+    bot.remove_webhook()
+    u = get_or_create_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
+    bot.send_message(
+        m.chat.id,
+        "👋 Привет! Я ИИ-наставник <b>Innertrade</b>.\nВыбирай кнопку или пиши текст.\nКоманды: /ping /reset",
+        reply_markup=main_menu()
+    )
+    add_progress(u, module="Generic", lesson="start", status="done")
+
+@bot.message_handler(commands=['ping'])
+def cmd_ping(m):
+    send(m, "pong")
+
+@bot.message_handler(commands=['reset'])
+def cmd_reset(m):
+    # Контекст теперь в БД, reset = отметка прогресса
+    u = get_or_create_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
+    add_progress(u, module="Generic", lesson="reset", status="done", note="User requested reset")
+    bot.send_message(m.chat.id, "Ок, обновили фокус. Выбирай раздел.", reply_markup=main_menu())
+
+# ===== Кнопки-интенты =====
+@bot.message_handler(func=lambda x: x.text in {
+    "🔁 Сброс","🧭 У меня ошибка","🧩 Хочу стратегию","🗓 Панель недели",
+    "🪪 Паспорт","📈 Мой прогресс","🧰 Материалы"
+})
+def on_menu(m):
+    u = get_or_create_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
+    t = m.text or ""
+    if t == "🔁 Сброс":
+        bot.send_message(m.chat.id, "Контекст обновлён. Чем займёмся?", reply_markup=main_menu())
+        return
+
+    if t == "🧭 У меня ошибка":
+        bot.send_message(m.chat.id,
+            "Опиши кратко ошибку (1–2 предложения). Я помогу прогнать через Mercedes и зафиксировать.")
+        add_progress(u, module="M1", lesson="L1", status="started", note="error intake")
+        return
+
+    if t == "🧩 Хочу стратегию":
+        bot.send_message(m.chat.id,
+            "Отлично! Начнём с основы ТС. Напиши: стиль/ТФ/инструменты (через запятую). Пример:\n"
+            "<i>интрадей, M15, фьючерс на индекс</i>")
+        add_progress(u, module="M2", lesson="L1", status="started")
+        return
+
+    if t == "🗓 Панель недели":
+        w = get_latest_week(u)
+        if w:
+            bot.send_message(m.chat.id,
+                f"Текущая панель:\n• Узел: {w.focus_node or '-'}\n• План: {w.plan or '-'}\n"
+                f"• Лимиты: {w.limits or '-'}\n• Ретро: {w.retro or '-'}\n\n"
+                "Напиши в формате:\nузел: ...\nплан: ...\nлимиты: ...")
+        else:
+            bot.send_message(m.chat.id,
+                "Панели пока нет. Напиши в формате:\nузел: ...\nплан: ...\нлимиты: ...")
+        return
+
+    if t == "🪪 Паспорт":
+        p = get_passport(u)
+        if p:
+            bot.send_message(m.chat.id,
+                f"<b>Паспорт трейдера</b>\nСтиль: {p.trading_style or '-'}\nТФ: {p.timeframe_pref or '-'}\n"
+                f"Инструменты: {p.instruments or '-'}\nРиск-профиль: {p.risk_profile or '-'}\n"
+                f"Архетипы: {p.archetypes or '-'}\nСубличности/роли: {p.subparts or '-'}\n"
+                f"Триггеры: {p.triggers or '-'}\nРитуалы: {p.rituals or '-'}\n\n"
+                "Чтобы обновить, напиши, например:\nстиль: свинг\nтф: H1\nинструменты: SPY, NQ")
+        else:
+            bot.send_message(m.chat.id,
+                "Паспорт пуст. Напиши в формате:\nстиль: ...\nтф: ...\nинструменты: ...\nриск: ...")
+        return
+
+    if t == "📈 Мой прогресс":
+        bot.send_message(m.chat.id,
+            "Прогресс фиксируется автоматически. Напиши, что сделал, и я отмечу. Пример:\n"
+            "M1-L2 done — «архетипы/роли разобрал»")
+        return
+
+    if t == "🧰 Материалы":
+        bot.send_message(m.chat.id,
+            "Материалы по курсу:\n• Mercedes/TOTE — краткий конспект\n• Архетипы/роли — памятка\n"
+            "• Чек-лист входа, выхода, риска\n• Сценарий «что делать, если поплыл»\n\n"
+            "Попроси: «пришли чек-лист входа» или «дай памятку по TOTE».")
+        return
+
+# ===== Текст: маршрутизация простым парсером =====
+def parse_kv(lines: List[str]) -> dict:
+    out = {}
+    for ln in lines:
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+
+@bot.message_handler(func=lambda _: True)
+def on_text(m):
+    u = get_or_create_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
+    text = (m.text or "").strip()
+
+    # 1) Паспорт — ключ: "стиль:", "тф:", "инструменты:", "риск:", "архетипы:", "субличности:", "триггеры:", "ритуалы:"
+    if any(key in text.lower() for key in ["стиль:", "тф:", "инструменты:", "риск:", "архетип", "сублич", "триггер", "ритуал"]):
+        kv = parse_kv([ln for ln in text.splitlines() if ":" in ln])
+        upsert_passport(
+            u,
+            trading_style=kv.get("стиль"),
+            timeframe_pref=kv.get("тф"),
+            instruments=kv.get("инструменты"),
+            risk_profile=kv.get("риск"),
+            archetypes=kv.get("архетипы"),
+            subparts=kv.get("субличности"),
+            triggers=kv.get("триггеры"),
+            rituals=kv.get("ритуалы"),
+        )
+        bot.send_message(m.chat.id, "Паспорт обновлён ✅", reply_markup=main_menu())
+        return
+
+    # 2) Панель недели — ключ: "узел:", "план:", "лимиты:", "ретро:"
+    if any(k in text.lower() for k in ["узел:", "план:", "лимиты:", "ретро:"]):
+        kv = parse_kv([ln for ln in text.splitlines() if ":" in ln])
+        week_start = date.today()  # упрощённо: неделя начинается сегодня
+        upsert_week(
+            u,
+            week_start=week_start,
+            focus_node=kv.get("узел"),
+            plan=kv.get("план"),
+            limits=kv.get("лимиты"),
+            retro=kv.get("ретро"),
+        )
+        bot.send_message(m.chat.id, "Панель недели сохранена ✅", reply_markup=main_menu())
+        return
+
+    # 3) Ошибка — эвристика: если пользователь начинал «У меня ошибка», просим Mercedes
+    if text.lower().startswith("ошибка:") or "ошибка" in text.lower():
+        # примем это как формулировку ошибки, попросим добить Mercedes
+        add_error(u, error_text=text, emotions=None, thoughts=None, behavior=None, beliefs=None, context=None, pattern=None, goal=None, tote_steps=None)
+        bot.send_message(m.chat.id,
+            "Принял формулировку ошибки. Теперь по Mercedes одним сообщением:\n"
+            "эмоции: ...\nмысли: ...\nповедение: ...\nубеждения: ...\nконтекст: ...")
+        return
+    if any(h in text.lower() for h in ["эмоции:", "мысли:", "поведение:", "убеждения:", "контекст:", "паттерн:", "цель:", "tote", "шаги:"]):
+        kv = parse_kv([ln for ln in text.splitlines() if ":" in ln])
+        # обновим последнюю ошибку
+        s = db()
+        try:
+            e = (
+                s.query(ErrorLog)
+                .filter(ErrorLog.user_id == u.id)
+                .order_by(ErrorLog.created_at.desc())
+                .first()
+            )
+            if e:
+                e.emotions = kv.get("эмоции", e.emotions)
+                e.thoughts = kv.get("мысли", e.thoughts)
+                e.behavior = kv.get("поведение", e.behavior)
+                e.beliefs  = kv.get("убеждения", e.beliefs)
+                e.context  = kv.get("контекст", e.context)
+                e.pattern  = kv.get("паттерн", e.pattern)
+                e.goal     = kv.get("цель", e.goal)
+                # допускаем "шаги:" или "tote:"
+                e.tote_steps = kv.get("шаги", kv.get("tote", e.tote_steps))
+                s.commit()
+                bot.send_message(m.chat.id, "Ошибка зафиксирована по Mercedes/TOTE ✅", reply_markup=main_menu())
+            else:
+                bot.send_message(m.chat.id, "Не нашёл последнюю ошибку. Напиши сначала «Ошибка: ...»")
+        finally:
+            s.close()
+        return
+
+    # 4) Прогресс — например "M1-L2 done ..."
+    if text.lower().startswith(("m1","m2","generic")):
+        parts = text.split()
+        mod_lsn = parts[0] if parts else "Generic"
+        status  = (parts[1] if len(parts)>1 else "done").lower()
+        note    = " ".join(parts[2:]) if len(parts)>2 else None
+        module, lesson = "Generic", "-"
+        if "-" in mod_lsn:
+            module, lesson = mod_lsn.split("-", 1)
+        add_progress(u, module=module, lesson=lesson, status=status, note=note)
+        bot.send_message(m.chat.id, "Прогресс обновлён ✅", reply_markup=main_menu())
+        return
+
+    # 5) Иначе — идём в GPT с персональным контекстом
+    try:
+        reply = ask_gpt_with_context(u, text)
+    except Exception as e:
+        reply = f"Ошибка GPT: {e}"
+    bot.send_message(m.chat.id, reply)
+
+# ==== Boot ====
 try:
     bot.remove_webhook()
     logging.info("Webhook removed (ok)")
 except Exception as e:
     logging.warning(f"Webhook remove warn: {e}")
 
-# ---- КЛАВИАТУРЫ ----
-USE_EXTENDED_MENU = True  # False = 3 кнопки, True = 8 кнопок
-
-INTENTS_MIN = [
-    "🆘 У меня ошибка",
-    "🧩 Хочу стратегию",
-    "🗣 Поговорим",
-]
-
-INTENTS_EXTENDED = [
-    "🆘 У меня ошибка",
-    "🛠 Мини-разбор (Mercedes)",
-    "🏗 Собрать/пересобрать ТС",
-    "❓ Не знаю, с чего начать",
-    "🚨 Экстренно: «поплыл»",
-    "📈 Мой прогресс (неделя)",
-    "🪪 Паспорт/профиль",
-    "📚 Материалы",
-]
-
-def build_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    intents = INTENTS_EXTENDED if USE_EXTENDED_MENU else INTENTS_MIN
-    # раскладываем по 2–3 кнопки в ряд
-    row = []
-    for i, label in enumerate(intents, 1):
-        row.append(types.KeyboardButton(label))
-        if len(row) == 3:
-            kb.row(*row)
-            row = []
-    if row:
-        kb.row(*row)
-    # нижний ряд: сервис
-    kb.row(types.KeyboardButton("🔄 Сброс"), types.KeyboardButton("🧭 Меню"))
-    return kb
-
-def send_long(chat_id, text):
-    MAX = 3500
-    for i in range(0, len(text), MAX):
-        bot.send_message(chat_id, text[i:i+MAX])
-
-# ---- МАППИНГ ИНТЕНТОВ -> ПОДСКАЗОК ДЛЯ GPT ----
-def intent_seed(user_text):
-    mapping = {
-        "🆘 У меня ошибка":
-            "INTENT=ERROR_START. Спроси кратко об ошибке в 1–2 вопросах. "
-            "Дай мини-чеклист фиксации: 'что делаю/что думаю/что чувствую'.",
-
-        "🛠 Мини-разбор (Mercedes)":
-            "INTENT=MERCEDES_MICRO. Проведи короткий прогон через MERCEDES (контекст, мысли, эмоции, поведение, убеждения). "
-            "Заверши 1 фразой-осознанием и 1 шагом TOTE на ближайшую сессию.",
-
-        "🏗 Собрать/пересобрать ТС":
-            "INTENT=BUILD_TS. Уточни стиль/таймфрейм/рынок. Дай каркас: вход-сопровождение-выход-риск. "
-            "Попроси заполнить 3 поля сейчас и предложи сохранить черновик.",
-
-        "❓ Не знаю, с чего начать":
-            "INTENT=START_HELP. Предложи 3 пути: (а) быстрый мини-разбор ошибки, (б) экспресс-каркас ТС, (в) карта целей на неделю. "
-            "Помоги выбрать 1 путь, затем задай 1 уточнение и дай 1 маленькое действие.",
-
-        "🚨 Экстренно: «поплыл»":
-            "INTENT=CRISIS. Дай протокол остановки: тайм-аут 3 мин, закрыть терминал, дыхание 4-7-8, проверить лимиты дня. "
-            "После стабилизации — один вопрос на осознание и решение по позиции по сценарию.",
-
-        "📈 Мой прогресс (неделя)":
-            "INTENT=WEEKLY_PANEL. Попроси 3 факта: что получилось/что не получилось/1 причина. "
-            "Сформируй фокус-узел на неделю и 2 ритуала поддержки. Итог — мини-план в 3 шагах.",
-
-        "🪪 Паспорт/профиль":
-            "INTENT=PASSPORT. Спроси кратко: рынок, стиль, ТФ, риск на сделку, лимит дня, главная ошибка. "
-            "Верни аккуратную карточку-паспорт и предложи обновить при необходимости.",
-
-        "📚 Материалы":
-            "INTENT=MATERIALS. Предложи навигацию: М1-урок1 (Mercedes+TOTE), М1-урок2 (архетипы), М1-урок3 (убеждения), "
-            "М2-урок1 (что такое ТС), М2-урок2 (входы), М2-урок3 (риск/выход), М2-урок4 (финализация). "
-            "Спроси, что открыть кратко."
-    }
-    # если нажали «Меню»/«Сброс»
-    if user_text in ("🧭 Меню", "🔄 Сброс"):
-        return None
-    # иначе — либо intent, либо свободный текст
-    return mapping.get(user_text, f"FREE_CHAT. Пользователь пишет: {user_text}")
-
-# ---------- HANDLERS ----------
-@bot.message_handler(commands=['start'])
-def cmd_start(m):
-    uid = m.from_user.id
-    # сброс контекста + system
-    history[uid] = [{"role":"system","content":SYSTEM_PROMPT}]
-    bot.send_message(
-        m.chat.id,
-        "👋 Привет! Я ИИ-наставник <b>Innertrade</b>.\n"
-        "Выбери кнопку-интент или напиши свой запрос.\nКоманды: /menu /reset /ping",
-        reply_markup=build_kb()
-    )
-
-@bot.message_handler(commands=['menu'])
-def cmd_menu(m):
-    bot.send_message(m.chat.id, "🧭 Меню обновлено. Выбери интент:", reply_markup=build_kb())
-
-@bot.message_handler(commands=['reset'])
-def cmd_reset(m):
-    uid = m.from_user.id
-    history[uid] = [{"role":"system","content":SYSTEM_PROMPT}]
-    bot.send_message(m.chat.id, "Контекст очищен. Готов продолжать.", reply_markup=build_kb())
-
-@bot.message_handler(commands=['ping'])
-def cmd_ping(m):
-    bot.send_message(m.chat.id, "pong")
-
-# Кнопки/текст
-@bot.message_handler(func=lambda x: True)
-def on_text(m):
-    uid = m.from_user.id
-    incoming = (m.text or "").strip()
-
-    if incoming == "🧭 Меню":
-        bot.send_message(m.chat.id, "🧭 Меню:", reply_markup=build_kb())
-        return
-    if incoming == "🔄 Сброс":
-        history[uid] = [{"role":"system","content":SYSTEM_PROMPT}]
-        bot.send_message(m.chat.id, "Контекст очищен.", reply_markup=build_kb())
-        return
-
-    seed = intent_seed(incoming)
-    try:
-        reply = ask_gpt(uid, seed if seed else incoming)
-    except Exception as e:
-        reply = f"Ошибка GPT: {e}"
-
-    send_long(m.chat.id, reply)
-
-# ---------- KEEPALIVE (Render/health) ----------
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Innertrade mentor is alive."
-
-@app.route("/health")
-def health():
-    return "pong"
-
 if __name__ == "__main__":
     logging.info("Starting keepalive web server…")
-    # запуск Flask + polling в отдельных потоках не нужен — telebot сам вThread; Flask просто держит порт
-    import threading
-    def run_bot():
-        logging.info("Starting polling…")
-        bot.infinity_polling(none_stop=True, timeout=60, long_polling_timeout=60)
-    threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    logging.info("Starting polling…")
+    # Flask keepalive на 0.0.0.0:10000 (Render сам проксирует)
+    app.run(host="0.0.0.0", port=10000, debug=False)
+    # Примечание: telebot.infinity_polling обычно блокирующий;
+    # В проде лучше разнести воркер/веб на разные процессы.
