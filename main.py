@@ -1,3 +1,4 @@
+# ===== main.py (Innertrade mentor bot) =====
 import os
 import logging
 from flask import Flask
@@ -5,60 +6,42 @@ import telebot
 from telebot import types
 from openai import OpenAI
 
-# ====== Ключи из переменных окружения ======
+# ---------- ENV ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")  # уже есть в окружении, пока не используем
+PORT = int(os.getenv("PORT", "10000"))
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets/Environment")
+    raise RuntimeError("Нет TELEGRAM_TOKEN в Env")
 if not OPENAI_KEY:
-    raise RuntimeError("Нет OPENAI_API_KEY в Secrets/Environment")
+    raise RuntimeError("Нет OPENAI_API_KEY в Env")
 
-# ====== Логи ======
+# ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ====== Инициализация ======
-bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+# ---------- GPT ----------
 client = OpenAI(api_key=OPENAI_KEY)
 
-# Память простая (RAM) — для демо; позже переведём в БД
-history = {}  # uid -> [{"role":"user"/"assistant","content":"..."}]
+# Храним контексты по пользователю
+history = {}  # uid -> [{"role":"system"/"user"/"assistant","content":"..."}]
 
-# ====== Тексты кнопок (интенты) ======
-BTN_ERROR         = "🧩 У меня ошибка"
-BTN_STRATEGY      = "🧭 Хочу стратегию"
-BTN_DONT_KNOW     = "🤷 Не знаю, с чего начать"
-BTN_PANIC         = "⛑ Экстренно: «поплыл»"
-BTN_PROGRESS      = "📈 Мой прогресс"
-BTN_PROFILE       = "🗂 Паспорт / профиль"
-BTN_MATERIALS     = "📚 Материалы"
+SYSTEM_PROMPT = (
+    "Ты — ИИ-наставник проекта Innertrade. "
+    "Твоя задача: быстро определить запрос пользователя и вести его по коротким шагам. "
+    "Отвечай структурировано, короткими блоками, с буллетами и мини-чеклистами. "
+    "Если пользователь жмёт кнопку-интент, продолжай как сценарий: задай 1–2 уточняющих вопроса, "
+    "дай готовый шаг и микрорезультат для фиксации. Не уходи в длинные лекции."
+)
 
-INTENT_BUTTONS = [
-    BTN_ERROR, BTN_STRATEGY, BTN_DONT_KNOW,
-    BTN_PANIC, BTN_PROGRESS, BTN_PROFILE, BTN_MATERIALS
-]
-
-# ====== Вспомогательные ======
-def make_menu_keyboard() -> types.ReplyKeyboardMarkup:
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(BTN_ERROR, BTN_STRATEGY)
-    kb.row(BTN_DONT_KNOW, BTN_PANIC)
-    kb.row(BTN_PROGRESS, BTN_PROFILE, BTN_MATERIALS)
-    return kb
-
-def remove_keyboard(chat_id):
-    bot.send_message(chat_id, "Обновляю меню…", reply_markup=types.ReplyKeyboardRemove())
-
-def send_menu(chat_id):
-    bot.send_message(
-        chat_id,
-        "Выбери пункт меню или напиши свой вопрос.",
-        reply_markup=make_menu_keyboard()
-    )
+def get_msgs(uid):
+    msgs = history.setdefault(uid, [])
+    # добавим System один раз
+    if not msgs or msgs[0].get("role") != "system":
+        msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+    return msgs
 
 def ask_gpt(uid, text):
-    msgs = history.setdefault(uid, [])
+    msgs = get_msgs(uid)
     msgs.append({"role": "user", "content": text})
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -69,100 +52,165 @@ def ask_gpt(uid, text):
     msgs.append({"role": "assistant", "content": reply})
     return reply
 
+# ---------- BOT ----------
+bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+
+# Снять вебхук (на всякий)
+try:
+    bot.remove_webhook()
+    logging.info("Webhook removed (ok)")
+except Exception as e:
+    logging.warning(f"Webhook remove warn: {e}")
+
+# ---- КЛАВИАТУРЫ ----
+USE_EXTENDED_MENU = True  # False = 3 кнопки, True = 8 кнопок
+
+INTENTS_MIN = [
+    "🆘 У меня ошибка",
+    "🧩 Хочу стратегию",
+    "🗣 Поговорим",
+]
+
+INTENTS_EXTENDED = [
+    "🆘 У меня ошибка",
+    "🛠 Мини-разбор (Mercedes)",
+    "🏗 Собрать/пересобрать ТС",
+    "❓ Не знаю, с чего начать",
+    "🚨 Экстренно: «поплыл»",
+    "📈 Мой прогресс (неделя)",
+    "🪪 Паспорт/профиль",
+    "📚 Материалы",
+]
+
+def build_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    intents = INTENTS_EXTENDED if USE_EXTENDED_MENU else INTENTS_MIN
+    # раскладываем по 2–3 кнопки в ряд
+    row = []
+    for i, label in enumerate(intents, 1):
+        row.append(types.KeyboardButton(label))
+        if len(row) == 3:
+            kb.row(*row)
+            row = []
+    if row:
+        kb.row(*row)
+    # нижний ряд: сервис
+    kb.row(types.KeyboardButton("🔄 Сброс"), types.KeyboardButton("🧭 Меню"))
+    return kb
+
 def send_long(chat_id, text):
     MAX = 3500
     for i in range(0, len(text), MAX):
         bot.send_message(chat_id, text[i:i+MAX])
 
-# ====== Команды ======
+# ---- МАППИНГ ИНТЕНТОВ -> ПОДСКАЗОК ДЛЯ GPT ----
+def intent_seed(user_text):
+    mapping = {
+        "🆘 У меня ошибка":
+            "INTENT=ERROR_START. Спроси кратко об ошибке в 1–2 вопросах. "
+            "Дай мини-чеклист фиксации: 'что делаю/что думаю/что чувствую'.",
+
+        "🛠 Мини-разбор (Mercedes)":
+            "INTENT=MERCEDES_MICRO. Проведи короткий прогон через MERCEDES (контекст, мысли, эмоции, поведение, убеждения). "
+            "Заверши 1 фразой-осознанием и 1 шагом TOTE на ближайшую сессию.",
+
+        "🏗 Собрать/пересобрать ТС":
+            "INTENT=BUILD_TS. Уточни стиль/таймфрейм/рынок. Дай каркас: вход-сопровождение-выход-риск. "
+            "Попроси заполнить 3 поля сейчас и предложи сохранить черновик.",
+
+        "❓ Не знаю, с чего начать":
+            "INTENT=START_HELP. Предложи 3 пути: (а) быстрый мини-разбор ошибки, (б) экспресс-каркас ТС, (в) карта целей на неделю. "
+            "Помоги выбрать 1 путь, затем задай 1 уточнение и дай 1 маленькое действие.",
+
+        "🚨 Экстренно: «поплыл»":
+            "INTENT=CRISIS. Дай протокол остановки: тайм-аут 3 мин, закрыть терминал, дыхание 4-7-8, проверить лимиты дня. "
+            "После стабилизации — один вопрос на осознание и решение по позиции по сценарию.",
+
+        "📈 Мой прогресс (неделя)":
+            "INTENT=WEEKLY_PANEL. Попроси 3 факта: что получилось/что не получилось/1 причина. "
+            "Сформируй фокус-узел на неделю и 2 ритуала поддержки. Итог — мини-план в 3 шагах.",
+
+        "🪪 Паспорт/профиль":
+            "INTENT=PASSPORT. Спроси кратко: рынок, стиль, ТФ, риск на сделку, лимит дня, главная ошибка. "
+            "Верни аккуратную карточку-паспорт и предложи обновить при необходимости.",
+
+        "📚 Материалы":
+            "INTENT=MATERIALS. Предложи навигацию: М1-урок1 (Mercedes+TOTE), М1-урок2 (архетипы), М1-урок3 (убеждения), "
+            "М2-урок1 (что такое ТС), М2-урок2 (входы), М2-урок3 (риск/выход), М2-урок4 (финализация). "
+            "Спроси, что открыть кратко."
+    }
+    # если нажали «Меню»/«Сброс»
+    if user_text in ("🧭 Меню", "🔄 Сброс"):
+        return None
+    # иначе — либо intent, либо свободный текст
+    return mapping.get(user_text, f"FREE_CHAT. Пользователь пишет: {user_text}")
+
+# ---------- HANDLERS ----------
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     uid = m.from_user.id
-    history[uid] = []  # чистим контекст
-    remove_keyboard(m.chat.id)    # убираем старую клавиатуру (Телеграм её кэширует)
+    # сброс контекста + system
+    history[uid] = [{"role":"system","content":SYSTEM_PROMPT}]
     bot.send_message(
         m.chat.id,
-        "👋 Привет! Я ИИ-наставник Innertrade.\n"
-        "Умею разбирать ошибки, собирать ТС и вести тебя по шагам.\n"
-        "Команды: /ping /reset /menu"
+        "👋 Привет! Я ИИ-наставник <b>Innertrade</b>.\n"
+        "Выбери кнопку-интент или напиши свой запрос.\nКоманды: /menu /reset /ping",
+        reply_markup=build_kb()
     )
-    send_menu(m.chat.id)
 
 @bot.message_handler(commands=['menu'])
 def cmd_menu(m):
-    remove_keyboard(m.chat.id)
-    send_menu(m.chat.id)
-
-@bot.message_handler(commands=['ping'])
-def cmd_ping(m):
-    bot.reply_to(m, "pong ✅")
+    bot.send_message(m.chat.id, "🧭 Меню обновлено. Выбери интент:", reply_markup=build_kb())
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(m):
-    history[m.from_user.id] = []
-    remove_keyboard(m.chat.id)
-    bot.send_message(m.chat.id, "Контекст очищен.")
-    send_menu(m.chat.id)
-
-# ====== Обработка кнопок (НОВЫЕ тексты) ======
-@bot.message_handler(func=lambda x: (x.text or "") in INTENT_BUTTONS)
-def on_buttons(m):
     uid = m.from_user.id
-    t = (m.text or "").strip()
+    history[uid] = [{"role":"system","content":SYSTEM_PROMPT}]
+    bot.send_message(m.chat.id, "Контекст очищен. Готов продолжать.", reply_markup=build_kb())
 
-    # Здесь маппим кнопку -> «семантический запрос» в GPT (пока без БД)
-    intent_map = {
-        BTN_ERROR:     "Начать разбор ошибки по модели MERCEDES + TOTE. Спроси, что болит, и веди по шагам.",
-        BTN_STRATEGY:  "Помоги собрать торговую стратегию: стиль, рынок, TF, вход/выход, риск. Веди чеклистом.",
-        BTN_DONT_KNOW:"Диагностика: задай 5-7 вопросов, чтобы понять, с чего начать (ошибка/ТС/психология).",
-        BTN_PANIC:     "Экстренный протокол: что делать когда «поплыл». Короткий сценарий с действиями и тайм-аутом.",
-        BTN_PROGRESS:  "Запросить короткий отчёт: что сделал за неделю/день, что улучшить, 1 следующий шаг.",
-        BTN_PROFILE:   "Паспорт трейдера: что это, какие поля, чем заполнить. Дай шаблон и как вести.",
-        BTN_MATERIALS: "Список материалов курса по модулям (без воды), что смотреть/делать в первую очередь."
-    }
+@bot.message_handler(commands=['ping'])
+def cmd_ping(m):
+    bot.send_message(m.chat.id, "pong")
 
-    try:
-        reply = ask_gpt(uid, intent_map.get(t, t))
-    except Exception as e:
-        reply = f"Ошибка GPT: {e}"
-
-    send_long(m.chat.id, reply)
-
-# ====== Любой другой текст ======
-@bot.message_handler(func=lambda _: True)
+# Кнопки/текст
+@bot.message_handler(func=lambda x: True)
 def on_text(m):
     uid = m.from_user.id
+    incoming = (m.text or "").strip()
+
+    if incoming == "🧭 Меню":
+        bot.send_message(m.chat.id, "🧭 Меню:", reply_markup=build_kb())
+        return
+    if incoming == "🔄 Сброс":
+        history[uid] = [{"role":"system","content":SYSTEM_PROMPT}]
+        bot.send_message(m.chat.id, "Контекст очищен.", reply_markup=build_kb())
+        return
+
+    seed = intent_seed(incoming)
     try:
-        reply = ask_gpt(uid, m.text or "")
+        reply = ask_gpt(uid, seed if seed else incoming)
     except Exception as e:
         reply = f"Ошибка GPT: {e}"
+
     send_long(m.chat.id, reply)
 
-# ====== Keepalive HTTP для Render/UptimeRobot ======
+# ---------- KEEPALIVE (Render/health) ----------
 app = Flask(__name__)
 
 @app.route("/")
-def root():
-    return "Innertrade bot alive"
+def home():
+    return "Innertrade mentor is alive."
 
 @app.route("/health")
 def health():
     return "pong"
 
 if __name__ == "__main__":
-    # TeleBot: снимаем webhook на всякий случай
-    try:
-        bot.remove_webhook()
-        logging.info("Webhook removed (ok)")
-    except Exception as e:
-        logging.warning(f"Webhook remove warn: {e}")
-
-    # Запускаем Flask (keepalive) и polling параллельно
-    from threading import Thread
-    def run_flask():
-        logging.info("Starting keepalive web server…")
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-    Thread(target=run_flask, daemon=True).start()
-
-    logging.info("Starting polling…")
-    bot.infinity_polling(none_stop=True, timeout=60, long_polling_timeout=60)
+    logging.info("Starting keepalive web server…")
+    # запуск Flask + polling в отдельных потоках не нужен — telebot сам вThread; Flask просто держит порт
+    import threading
+    def run_bot():
+        logging.info("Starting polling…")
+        bot.infinity_polling(none_stop=True, timeout=60, long_polling_timeout=60)
+    threading.Thread(target=run_bot, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT)
