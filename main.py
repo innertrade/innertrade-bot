@@ -1,167 +1,150 @@
-# main.py
 import os
 import logging
-from collections import deque
-
 from flask import Flask
 import telebot
 from telebot import types
 from openai import OpenAI
 
-# ====== Env ======
+# ========= Env =========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PORT = int(os.getenv("PORT", "10000"))
-
+OPENAI_KEY     = os.getenv("OPENAI_API_KEY")
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Нет TELEGRAM_TOKEN в переменных окружения")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Нет OPENAI_API_KEY в переменных окружения")
+    raise RuntimeError("Нет TELEGRAM_TOKEN в Environment")
+if not OPENAI_KEY:
+    raise RuntimeError("Нет OPENAI_API_KEY в Environment")
 
-# ====== Logs ======
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s: %(message)s"
-)
+# ========= OpenAI клиент =========
+client = OpenAI(api_key=OPENAI_KEY)
 
-# ====== OpenAI client (новый SDK) ======
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ========= Логи =========
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ====== Telegram bot ======
+# ========= Telegram =========
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# на всякий случай снимем вебхук (мы используем polling)
+# На всякий случай снимаем webhook
 try:
     bot.remove_webhook()
     logging.info("Webhook removed (ok)")
 except Exception as e:
     logging.warning(f"Webhook remove warn: {e}")
 
-# ====== Простая «память» диалога (per-user)
-# deque с ограничением, чтобы не рос бесконечно
-history = {}  # uid -> deque of messages (dict role/content)
-MAX_TURNS = 20
+# ========= Память диалога =========
+# простая in-memory история: {user_id: [ {role, content}, ... ]}
+history = {}
 
-def ensure_history(uid: int):
-    if uid not in history:
-        history[uid] = deque(maxlen=MAX_TURNS)
+def ask_gpt(uid: int, user_text: str) -> str:
+    """
+    Вызов Chat Completions (новый SDK).
+    """
+    msgs = history.setdefault(uid, [])
+    msgs.append({"role": "user", "content": user_text})
 
-def ask_gpt(uid: int, text: str) -> str:
-    """Вызов Chat Completions через новый SDK."""
-    ensure_history(uid)
-    msgs = list(history[uid])  # скопируем в список
-    msgs.append({"role": "user", "content": text})
-
-    # вызов модели
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.5,
         messages=msgs
     )
     reply = (resp.choices[0].message.content or "").strip()
-
-    # обновим историю
-    history[uid].append({"role": "user", "content": text})
-    history[uid].append({"role": "assistant", "content": reply})
+    msgs.append({"role": "assistant", "content": reply})
     return reply
 
 def send_long(chat_id: int, text: str):
-    """Отправка длинных сообщений чанками. Без reply_to!"""
+    """
+    Режем длинные ответы, И БЕЗ reply_to (чтобы не было «ответа на сообщение»).
+    """
     MAX = 3500
     for i in range(0, len(text), MAX):
         bot.send_message(chat_id, text[i:i+MAX])
 
-# ====== Команды ======
+# ========= Клавиатура =========
+def main_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(
+        types.KeyboardButton("У меня ошибка"),
+        types.KeyboardButton("Хочу стратегию"),
+        types.KeyboardButton("Поговорим")
+    )
+    kb.row(
+        types.KeyboardButton("Чек-лист"),
+        types.KeyboardButton("Сброс")
+    )
+    return kb
+
+# ========= Команды =========
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     uid = m.from_user.id
-    history[uid] = deque(maxlen=MAX_TURNS)
-
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton("Модуль 1"), types.KeyboardButton("Модуль 2"))
-    kb.row(types.KeyboardButton("Чек-лист"), types.KeyboardButton("Фиксация"), types.KeyboardButton("Сброс"))
-
+    history[uid] = []
     bot.send_message(
         m.chat.id,
         "👋 Привет! Я ИИ-наставник Innertrade.\n"
         "Выбери кнопку или напиши текст.\n"
         "Команды: /ping /reset",
-        reply_markup=kb
+        reply_markup=main_kb()
     )
 
 @bot.message_handler(commands=['ping'])
 def cmd_ping(m):
-    # только "pong" — без лишнего текста
-    bot.reply_to(m, "pong")
+    bot.send_message(m.chat.id, "pong")
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(m):
-    history[m.from_user.id] = deque(maxlen=MAX_TURNS)
-    bot.reply_to(m, "Контекст очищен.")
+    history[m.from_user.id] = []
+    bot.send_message(m.chat.id, "Контекст очищен.", reply_markup=main_kb())
 
-# ====== Кнопки ======
-BUTTON_SET = {"Модуль 1", "Модуль 2", "Чек-лист", "Фиксация", "Сброс"}
-ALIASES = {
-    "Модуль 1": "Готов",          # якорь под наши сценарии
-    "Модуль 2": "ТС",             # якорь под наши сценарии
-    "Чек-лист": "чеклист",
-    "Фиксация": "фиксация",
+# ========= Кнопки-интенты =========
+INTENT_MAP = {
+    "У меня ошибка":  "Давай разберём мою торговую ошибку.",
+    "Хочу стратегию": "Помоги собрать торговую систему/стратегию под меня.",
+    "Поговорим":      "Просто поболтаем про трейдинг и мои вопросы.",
+    "Чек-лист":       "Дай короткий чек-лист на сегодня по трейдингу."
 }
 
-@bot.message_handler(func=lambda x: isinstance(x.text, str) and x.text.strip() in BUTTON_SET)
+@bot.message_handler(func=lambda x: x.text in INTENT_MAP.keys() or x.text == "Сброс")
 def on_buttons(m):
     uid = m.from_user.id
-    t = m.text.strip()
-
+    t = (m.text or "").strip()
     if t == "Сброс":
-        history[uid] = deque(maxlen=MAX_TURNS)
-        bot.send_message(m.chat.id, "Контекст очищен. Нажми «Модуль 1» или «Модуль 2».")
+        history[uid] = []
+        bot.send_message(m.chat.id, "Контекст очищен. Начнём заново.", reply_markup=main_kb())
         return
 
-    prompt = ALIASES.get(t, t)
     try:
-        reply = ask_gpt(uid, prompt)
+        reply = ask_gpt(uid, INTENT_MAP[t])
     except Exception as e:
-        logging.exception("ask_gpt error (buttons)")
         reply = f"Ошибка GPT: {e}"
+
     send_long(m.chat.id, reply)
 
-# ====== Любой текст ======
+# ========= Обычный текст =========
 @bot.message_handler(func=lambda _: True)
 def on_text(m):
     uid = m.from_user.id
-    text = (m.text or "").strip()
-    if not text:
-        return
     try:
-        reply = ask_gpt(uid, text)
+        reply = ask_gpt(uid, m.text or "")
     except Exception as e:
-        logging.exception("ask_gpt error (text)")
         reply = f"Ошибка GPT: {e}"
     send_long(m.chat.id, reply)
 
-# ====== Keepalive HTTP (для Render) ======
+# ========= Keepalive (Render/UptimeRobot) =========
 app = Flask(__name__)
 
-@app.route("/", methods=["GET", "HEAD"])
-def home():
-    return "OK", 200
+@app.get("/")
+def root():
+    return "OK"
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
-    # UptimeRobot будет бить сюда и ожидать "pong"
-    return "pong", 200
+    return "pong"
 
 if __name__ == "__main__":
     logging.info("Starting keepalive web server…")
-    # Flask в отдельном треде поднимать не нужно — Render запускает один процесс.
-    # Он слушает порт, а бот крутится параллельно через polling в другом треде.
-    # Поэтому запустим Flask в отдельном треде руками:
-    import threading
-    def run_flask():
-        app.run(host="0.0.0.0", port=PORT, debug=False)
-
-    threading.Thread(target=run_flask, daemon=True).start()
-
     logging.info("Starting polling…")
+    # Запускаем Flask в отдельном порте, чтобы UptimeRobot/Render могли пинговать
+    from threading import Thread
+    def run_flask():
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    Thread(target=run_flask, daemon=True).start()
+
     bot.infinity_polling(none_stop=True, timeout=60, long_polling_timeout=60)
