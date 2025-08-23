@@ -1,5 +1,4 @@
 import os
-import re
 import logging
 from flask import Flask, jsonify
 from telebot import TeleBot, types
@@ -20,7 +19,7 @@ if not TELEGRAM_TOKEN:
 if not OPENAI_API_KEY:
     raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
 
-# ---------- OPENAI ----------
+# ---------- OPENAI (пока не используется, но оставим) ----------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------- DB (опционально) ----------
@@ -66,42 +65,17 @@ def main_menu():
     kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
     return kb
 
-# Нормализация текста: убираем эмодзи/служебные символы/дубликаты пробелов
-EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U0001F1E6-\U0001F1FF]+")
-def norm(txt: str) -> str:
-    if not txt:
-        return ""
-    t = EMOJI_RE.sub(" ", txt)
-    t = t.replace("—", "-").replace("–", "-")
-    t = re.sub(r"\s+", " ", t).strip().lower()
-    return t
+# Нормализация текста для матчинга
+def norm(s: str) -> str:
+    return (s or "").strip().lower().replace("ё", "е")
 
-# Карта интентов по ключевым фразам БЕЗ эмодзи
-INTENT_MAP = {
-    "у меня ошибка": "error",
-    "хочу стратегию": "strategy",
-    "паспорт": "passport",
-    "панель недели": "week_panel",
-    "экстренно: поплыл": "panic",
-    "экстренно поплыл": "panic",
-    "не знаю, с чего начать": "start_help",
-    "не знаю с чего начать": "start_help",
-}
-
-def detect_intent(text: str) -> str | None:
-    t = norm(text)
-    logging.info(f"RAW text: {repr(text)} | normalized: {t}")
-    for k, intent in INTENT_MAP.items():
-        if k in t:
-            return intent
-    return None
-
-# /start и меню
+# /start, /menu, /reset
 @bot.message_handler(commands=["start", "menu", "reset"])
 def cmd_start(m):
+    logging.info(f"/start|/menu|/reset from {m.from_user.id}")
     bot.send_message(
         m.chat.id,
-        "👋 Привет! Я ИИ-наставник *Innertrade*.\nВыбери кнопку или напиши текст.\nКоманды: /ping /reset",
+        "👋 Привет! Я ИИ-наставник *Innertrade*.\nВыбери кнопку или напиши текст.\nКоманды: /ping /echo",
         reply_markup=main_menu()
     )
     save_state(m.from_user.id, intent="idle")
@@ -110,11 +84,20 @@ def cmd_start(m):
 def cmd_ping(m):
     bot.send_message(m.chat.id, "pong")
 
-# ---------- ОБРАБОТЧИК ВСЕХ ТЕКСТОВ (одна точка входа) ----------
+@bot.message_handler(commands=["echo"])
+def cmd_echo(m):
+    # покажем «сырое» содержимое на всякий случай
+    bot.send_message(m.chat.id, f"Текст, который получил:\n`{m.text}`", parse_mode="Markdown")
+
+# ---------- ЕДИНЫЙ РОУТЕР ПО ТЕКСТУ ----------
 @bot.message_handler(content_types=["text"])
-def handle_text(m):
-    intent = detect_intent(m.text or "")
-    if intent == "error":
+def route_text(m):
+    raw = m.text or ""
+    logging.info(f"IN [{m.from_user.id}]: {repr(raw)}")
+    n = norm(raw)
+
+    # Без эмодзи, только ключевая фраза
+    if "у меня ошибка" in n:
         save_state(m.from_user.id, "error")
         bot.send_message(
             m.chat.id,
@@ -125,7 +108,7 @@ def handle_text(m):
         )
         return
 
-    if intent == "strategy":
+    if "хочу стратегию" in n:
         save_state(m.from_user.id, "strategy")
         bot.send_message(
             m.chat.id,
@@ -137,7 +120,7 @@ def handle_text(m):
         )
         return
 
-    if intent == "passport":
+    if "паспорт" in n:
         save_state(m.from_user.id, "passport")
         bot.send_message(
             m.chat.id,
@@ -146,7 +129,7 @@ def handle_text(m):
         )
         return
 
-    if intent == "week_panel":
+    if "панел" in n and "недел" in n:  # ловим «панель недели»
         save_state(m.from_user.id, "week_panel")
         bot.send_message(
             m.chat.id,
@@ -155,17 +138,17 @@ def handle_text(m):
         )
         return
 
-    if intent == "panic":
+    if "экстренно" in n or "поплыл" in n:
         save_state(m.from_user.id, "panic")
         bot.send_message(
             m.chat.id,
-            "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) Сделай 10 медленных вдохов\n"
-            "4) Запиши триггер (что именно выбило)\n5) Вернись к плану сделки или закрой позицию по правилу",
+            "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) 10 медленных вдохов\n"
+            "4) Запиши триггер (что выбило)\n5) Вернись к плану или закрой позицию по правилу",
             reply_markup=main_menu()
         )
         return
 
-    if intent == "start_help":
+    if "не знаю" in n and "с чего начать" in n:
         save_state(m.from_user.id, "start_help")
         bot.send_message(
             m.chat.id,
@@ -175,7 +158,7 @@ def handle_text(m):
         )
         return
 
-    # Фолбэк на произвольный текст
+    # Фолбэк
     bot.send_message(
         m.chat.id,
         "Принял. Чтобы было быстрее, выбери пункт в меню ниже или напиши /menu.",
@@ -187,7 +170,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return "OK v6"
+    return "OK v5"
 
 @app.route("/health")
 def health():
@@ -200,7 +183,7 @@ def start_polling():
     except Exception as e:
         logging.warning(f"Webhook remove warn: {e}")
     logging.info("Starting polling…")
-    # skip_pending=True — чтобы не разматывать старые очереди
+    # важные параметры: увеличенный timeout и пропуск накопившихся апдейтов
     bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
 
 if __name__ == "__main__":
