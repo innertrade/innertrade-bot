@@ -1,7 +1,6 @@
 import os
 import logging
-import re
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
 from telebot import TeleBot, types
 from openai import OpenAI
 from sqlalchemy import create_engine, text
@@ -14,26 +13,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL   = os.getenv("DATABASE_URL")
+WEBHOOK_BASE   = os.getenv("TELEGRAM_WEBHOOK_BASE")  # напр. https://innertrade-bot.onrender.com
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets")
 if not OPENAI_API_KEY:
     raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
+if not WEBHOOK_BASE:
+    raise RuntimeError("Нет TELEGRAM_WEBHOOK_BASE в Secrets (например, https://<ваш-домен>)")
 
-# ---------- OPENAI (на будущее) ----------
+WEBHOOK_PATH = f"/webhook/{TELEGRAM_TOKEN}"           # уникальный путь
+WEBHOOK_URL  = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"        # полный URL вебхука
+
+# ---------- OPENAI ----------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- DB ----------
+# ---------- DB (опционально) ----------
 engine = None
 if DATABASE_URL:
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS user_state (
                 user_id BIGINT PRIMARY KEY,
-                intent  TEXT,
-                data    JSONB
+                intent TEXT,
+                data JSONB
             );
             """))
         logging.info("DB connected & migrated")
@@ -58,7 +63,7 @@ def save_state(user_id: int, intent: str, data: dict | None = None):
 # ---------- TELEGRAM ----------
 bot = TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
 
-# Главное меню
+# Клавиатура главного меню
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🚑 У меня ошибка", "🧩 Хочу стратегию")
@@ -66,7 +71,7 @@ def main_menu():
     kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
     return kb
 
-# /start, /menu, /reset
+# /start и меню
 @bot.message_handler(commands=["start", "menu", "reset"])
 def cmd_start(m):
     bot.send_message(
@@ -80,17 +85,19 @@ def cmd_start(m):
 def cmd_ping(m):
     bot.send_message(m.chat.id, "pong")
 
-# ---------- ИНТЕНТЫ ----------
+# ---------- ХЕНДЛЕРЫ ИНТЕНТОВ ----------
+@bot.message_handler(func=lambda msg: msg.text == "🚑 У меня ошибка")
 def intent_error(m):
     save_state(m.from_user.id, "error")
     bot.send_message(
         m.chat.id,
-        "Разберём через *MERCEDES + TOTE*.\n\n"
+        "Давай разберём через *MERCEDES + TOTE*.\n\n"
         "*M* Мотивация?\n*E* Эмоции?\n*R* Результат?\n*C* Контекст?\n*E* Эффект?\n*D* Действия?\n*S* Стратегия?\n\n"
         "*T* Test — что пошло не так?\n*O* Operate — что сделал?\n*T* Test — результат?\n*E* Evolve — что изменишь?",
         reply_markup=main_menu()
     )
 
+@bot.message_handler(func=lambda msg: msg.text == "🧩 Хочу стратегию")
 def intent_strategy(m):
     save_state(m.from_user.id, "strategy")
     bot.send_message(
@@ -102,6 +109,7 @@ def intent_strategy(m):
         reply_markup=main_menu()
     )
 
+@bot.message_handler(func=lambda msg: msg.text == "📄 Паспорт")
 def intent_passport(m):
     save_state(m.from_user.id, "passport")
     bot.send_message(
@@ -110,6 +118,7 @@ def intent_passport(m):
         reply_markup=main_menu()
     )
 
+@bot.message_handler(func=lambda msg: msg.text == "🗒 Панель недели")
 def intent_week_panel(m):
     save_state(m.from_user.id, "week_panel")
     bot.send_message(
@@ -118,20 +127,17 @@ def intent_week_panel(m):
         reply_markup=main_menu()
     )
 
+@bot.message_handler(func=lambda msg: msg.text == "🆘 Экстренно: поплыл")
 def intent_panic(m):
     save_state(m.from_user.id, "panic")
     bot.send_message(
         m.chat.id,
-        "🛑 Стоп-протокол «поплыл»:\n"
-        "1) Пауза 2 мин\n"
-        "2) Закрой график/терминал\n"
-        "3) 10 медленных вдохов\n"
-        "4) Запиши триггер: *что* выбило\n"
-        "5) Действуй по плану сделки или закрой по правилу\n"
-        "_Вернись к лимитам и чек-листу перед следующим входом_",
+        "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) 10 медленных вдохов\n"
+        "4) Запиши триггер (что именно выбило)\n5) Вернись к плану сделки или закрой позицию по правилу",
         reply_markup=main_menu()
     )
 
+@bot.message_handler(func=lambda msg: msg.text == "🤔 Не знаю, с чего начать")
 def intent_start_help(m):
     save_state(m.from_user.id, "start_help")
     bot.send_message(
@@ -141,93 +147,49 @@ def intent_start_help(m):
         reply_markup=main_menu()
     )
 
-# ---------- ХЕНДЛЕРЫ ДЛЯ КНОПОК ----------
-@bot.message_handler(func=lambda msg: msg.text == "🚑 У меня ошибка")
-def intent_error_btn(m): intent_error(m)
-
-@bot.message_handler(func=lambda msg: msg.text == "🧩 Хочу стратегию")
-def intent_strategy_btn(m): intent_strategy(m)
-
-@bot.message_handler(func=lambda msg: msg.text == "📄 Паспорт")
-def intent_passport_btn(m): intent_passport(m)
-
-@bot.message_handler(func=lambda msg: msg.text == "🗒 Панель недели")
-def intent_week_panel_btn(m): intent_week_panel(m)
-
-@bot.message_handler(func=lambda msg: msg.text == "🆘 Экстренно: поплыл")
-def intent_panic_btn(m): intent_panic(m)
-
-@bot.message_handler(func=lambda msg: msg.text == "🤔 Не знаю, с чего начать")
-def intent_start_help_btn(m): intent_start_help(m)
-
-# ---------- УМНЫЙ РОУТЕР ДЛЯ СВОБОДНОГО ТЕКСТА ----------
-def detect_intent(text: str) -> str | None:
-    t = text.lower()
-    # убрать лишние пробелы и базовую пунктуацию
-    t = re.sub(r"[^\w\sёа-я-]", " ", t)  # простая очистка
-    t = re.sub(r"\s+", " ", t).strip()
-
-    if any(k in t for k in ["поплыл", "паника", "panic", "экстренн"]):
-        return "panic"
-    if any(k in t for k in ["ошибк"]):  # ошибка/ошибку/ошибки
-        return "error"
-    if any(k in t for k in ["стратег"]):
-        return "strategy"
-    if any(k in t for k in ["паспорт"]):
-        return "passport"
-    if any(k in t for k in ["панел", "недел"]):
-        return "week_panel"
-    if any(k in t for k in ["не знаю", "с чего начать", "начать не знаю"]):
-        return "start_help"
-    return None
-
+# Фолбэк: если пользователь пишет текст мимо кнопок
 @bot.message_handler(content_types=["text"])
-def router_or_fallback(m):
-    intent = detect_intent(m.text or "")
-    if intent == "panic":
-        return intent_panic(m)
-    if intent == "error":
-        return intent_error(m)
-    if intent == "strategy":
-        return intent_strategy(m)
-    if intent == "passport":
-        return intent_passport(m)
-    if intent == "week_panel":
-        return intent_week_panel(m)
-    if intent == "start_help":
-        return intent_start_help(m)
-
-    # Фолбэк — если ничего не распознали
+def fallback(m):
     bot.send_message(
         m.chat.id,
         "Принял. Чтобы было быстрее, выбери пункт в меню ниже или напиши /menu.",
         reply_markup=main_menu()
     )
 
-# ---------- KEEPALIVE для Render ----------
+# ---------- FLASK (WEBHOOK) ----------
 app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return "OK v5"
+    return "OK webhook v1"
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
 
-def start_polling():
+# Точка приёма апдейтов от Telegram
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def telegram_webhook():
+    try:
+        json_str = request.get_data().decode("utf-8")
+        update = types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+    except Exception as e:
+        logging.exception(f"webhook error: {e}")
+    return "OK", 200
+
+def setup_webhook():
+    # Сначала снимаем старый вебхук
     try:
         bot.remove_webhook()
-        logging.info("Webhook removed (ok)")
-    except Exception as e:
-        logging.warning(f"Webhook remove warn: {e}")
-    logging.info("Starting polling…")
-    bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
+    except Exception:
+        pass
+    # Ставим новый
+    ok = bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+    logging.info(f"set_webhook={ok} url={WEBHOOK_URL}")
 
 if __name__ == "__main__":
-    import threading
-    t = threading.Thread(target=start_polling, daemon=True)
-    t.start()
+    setup_webhook()
     port = int(os.getenv("PORT", "10000"))
-    logging.info("Starting keepalive web server…")
+    logging.info(f"Starting Flask on port {port} …")
     app.run(host="0.0.0.0", port=port)
