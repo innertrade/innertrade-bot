@@ -1,242 +1,309 @@
 import os
 import logging
-from datetime import datetime
-from flask import Flask
+from openai import OpenAI
 import telebot
 from telebot import types
-from openai import OpenAI
+from flask import Flask
 
-# ====== ENV ======
+# ====== Ключи ======
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_KEY     = os.getenv("OPENAI_API_KEY")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")  # на будущее: использование БД уже настроено в окружении
+
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets")
 if not OPENAI_KEY:
     raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
 
-# ====== OpenAI (новый SDK) ======
 client = OpenAI(api_key=OPENAI_KEY)
 
 # ====== Логи ======
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("innertrade")
 
-# ====== Flask keepalive ======
+bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+
+# ====== Keepalive (для Render / UptimeRobot) ======
 app = Flask(__name__)
 
-@app.get("/")
-def root():
-    return "Innertrade bot OK"
+@app.route("/", methods=["GET"])
+def index():
+    return "OK: Innertrade bot"
 
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return "pong"
 
-# ====== Telegram bot ======
-bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+# ====== Память (RAM) ======
+history = {}       # uid -> [{"role":"user"/"assistant","content":"..."}]
+user_state = {}    # uid -> {"flow": "passport|weekly|error|...", "step": int, "data": dict}
 
-# На всякий случай снимем вебхук (мы работаем в polling)
-try:
-    bot.remove_webhook()
-    log.info("Webhook removed (ok)")
-except Exception as e:
-    log.warning(f"Webhook remove warn: {e}")
-
-# Память диалога в RAM (персист при необходимости прикрутим к БД)
-history = {}  # uid -> [{"role": "...", "content": "..."}]
-
-def ask_gpt(uid: int, text: str) -> str:
+# ====== GPT ======
+def ask_gpt(uid, text):
     msgs = history.setdefault(uid, [])
     msgs.append({"role": "user", "content": text})
-
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        temperature=0.4,
-        messages=[
-            # Лёгкий системный каркас, чтобы GPT держал контекст проекта
-            {"role": "system", "content":
-             "Ты ИИ-наставник Innertrade. Коротко, по делу. Если пользователь нажимает кнопки меню, \
-возвращай структурированные ответы. Если запрос общий, помогай, но не выдумывай факты про его сделки."}
-        ] + msgs
+        temperature=0.5,
+        messages=msgs
     )
     reply = (resp.choices[0].message.content or "").strip()
     msgs.append({"role": "assistant", "content": reply})
     return reply
 
-def send_long(chat_id, text, reply_to=None):
+def send_long(chat_id, text):
     MAX = 3500
     for i in range(0, len(text), MAX):
-        bot.send_message(chat_id, text[i:i+MAX], reply_to_message_id=reply_to if i == 0 else None)
+        bot.send_message(chat_id, text[i:i+MAX])
 
-def main_keyboard():
+# ====== Меню ======
+def build_main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton("Ошибка"), types.KeyboardButton("Стратегия"), types.KeyboardButton("Поговорим"))
+    kb.row(types.KeyboardButton("Ошибка"), types.KeyboardButton("ТС / Стратегия"))
     kb.row(types.KeyboardButton("Паспорт"), types.KeyboardButton("Панель недели"))
-    kb.row(types.KeyboardButton("Материалы"), types.KeyboardButton("Прогресс"), types.KeyboardButton("Сброс"))
+    kb.row(types.KeyboardButton("Материалы"), types.KeyboardButton("Прогресс"))
+    kb.row(types.KeyboardButton("Профиль"), types.KeyboardButton("Сброс"))
     return kb
 
-# ====== /start ======
+# ====== Хелперы сценариев ======
+def start_passport(uid):
+    user_state[uid] = {"flow": "passport", "step": 1, "data": {}}
+    return ("Паспорт трейдера.\n"
+            "1/6) На каком рынке/инструментах торгуешь? (пример: акции США, EURUSD, BTC, фьючерсы…)")
+
+def continue_passport(uid, text):
+    st = user_state.get(uid, {})
+    step = st.get("step", 1)
+    data = st.get("data", {})
+
+    if step == 1:
+        data["рынок"] = text.strip()
+        user_state[uid] = {"flow": "passport", "step": 2, "data": data}
+        return "2/6) Твой стиль: скальпинг, интрадей, свинг, позиционный?"
+    elif step == 2:
+        data["стиль"] = text.strip()
+        user_state[uid] = {"flow": "passport", "step": 3, "data": data}
+        return "3/6) Рабочие таймфреймы?"
+    elif step == 3:
+        data["таймфреймы"] = text.strip()
+        user_state[uid] = {"flow": "passport", "step": 4, "data": data}
+        return "4/6) Средняя дневная сессия (время): когда торгуешь?"
+    elif step == 4:
+        data["время"] = text.strip()
+        user_state[uid] = {"flow": "passport", "step": 5, "data": data}
+        return "5/6) Риск на сделку (% от депо)?"
+    elif step == 5:
+        data["риск_на_сделку"] = text.strip()
+        user_state[uid] = {"flow": "passport", "step": 6, "data": data}
+        return "6/6) Главная слабость/ошибка (одно предложение)?"
+    elif step == 6:
+        data["главная_ошибка"] = text.strip()
+        user_state[uid] = {"flow": None, "step": 0, "data": data}
+        # TODO: здесь можно сохранить data в БД
+        return ("Готово ✅ Паспорт сохранён (локально)."
+                "\nКратко:\n"
+                f"- Рынок: {data.get('рынок')}\n"
+                f"- Стиль: {data.get('стиль')}\n"
+                f"- ТФ: {data.get('таймфреймы')}\n"
+                f"- Время: {data.get('время')}\n"
+                f"- Риск: {data.get('риск_на_сделку')}\n"
+                f"- Ошибка: {data.get('главная_ошибка')}")
+    else:
+        return start_passport(uid)
+
+def start_weekly(uid):
+    user_state[uid] = {"flow": "weekly", "step": 1, "data": {}}
+    return ("Панель недели 🗓️\n"
+            "1/4) Один фокус на эту неделю (узел/навык). Пример: «Не пересиживаю убытки» "
+            "или «Только один сетап A+ в день». Напиши свой фокус.")
+
+def continue_weekly(uid, text):
+    st = user_state.get(uid, {})
+    step = st.get("step", 1)
+    data = st.get("data", {})
+
+    if step == 1:
+        data["фокус"] = text.strip()
+        user_state[uid] = {"flow": "weekly", "step": 2, "data": data}
+        return ("2/4) План на 5 торговых дней: коротко — что делаешь ежедневно, чтобы двигаться к фокусу?"
+                "\nПример: «Перед сессией — чек-лист входа; после — 2 строки в журнал»")
+    elif step == 2:
+        data["план"] = text.strip()
+        user_state[uid] = {"flow": "weekly", "step": 3, "data": data}
+        return ("3/4) Лимиты и рамки: max риск/день, stop-trading триггеры?"
+                "\nПример: «Макс. -2R/день, после 2 подряд стопов — пауза 30 мин»")
+    elif step == 3:
+        data["лимиты"] = text.strip()
+        user_state[uid] = {"flow": "weekly", "step": 4, "data": data}
+        return ("4/4) Короткая ретроспектива недели (позже): как поймёшь, что неделя удалась?"
+                "\nПример: «Выполнил 5/5 ритуалов, 0 нарушений по лимитам»")
+    elif step == 4:
+        data["критерий_успеха"] = text.strip()
+        user_state[uid] = {"flow": None, "step": 0, "data": data}
+        # TODO: здесь можно сохранить data в БД
+        return ("Панель недели сохранена ✅\n"
+                f"Фокус: {data.get('фокус')}\n"
+                f"План: {data.get('план')}\n"
+                f"Лимиты: {data.get('лимиты')}\n"
+                f"Критерий успеха: {data.get('критерий_успеха')}")
+    else:
+        return start_weekly(uid)
+
+def start_error(uid):
+    user_state[uid] = {"flow": "error", "step": 1, "data": {}}
+    return ("Разбор ошибки (MER+TOTE).\n"
+            "Коротко опиши, что произошло (ситуация).")
+
+def continue_error(uid, text):
+    st = user_state.get(uid, {})
+    step = st.get("step", 1)
+    data = st.get("data", {})
+
+    if step == 1:
+        data["ситуация"] = text.strip()
+        user_state[uid] = {"flow": "error", "step": 2, "data": data}
+        return "Какое было <b>эмоциональное состояние</b> (M из MERCEDES)?"
+    elif step == 2:
+        data["emotion"] = text.strip()
+        user_state[uid] = {"flow": "error", "step": 3, "data": data}
+        return "Какие были <b>убеждения/мысли</b> (E)?"
+    elif step == 3:
+        data["beliefs"] = text.strip()
+        user_state[uid] = {"flow": "error", "step": 4, "data": data}
+        return "Что ты <b>сделал</b> (R — реакция/поведение)?"
+    elif step == 4:
+        data["reaction"] = text.strip()
+        user_state[uid] = {"flow": "error", "step": 5, "data": data}
+        return "Результат и вывод (S). Что менять в TOTE-петле в следующий раз?"
+    elif step == 5:
+        data["result"] = text.strip()
+        user_state[uid] = {"flow": None, "step": 0, "data": data}
+        # TODO: сохранить в БД
+        return ("Готово ✅ Разбор сохранён (локально).\n"
+                "Напомнить о ритуале «тайм-аут после ошибки» перед следующей сессией?")
+    else:
+        return start_error(uid)
+
+# ====== Команды ======
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     uid = m.from_user.id
     history[uid] = []
+    user_state[uid] = {"flow": None, "step": 0, "data": {}}
     bot.send_message(
         m.chat.id,
         "👋 Привет! Я ИИ-наставник Innertrade.\nВыбери кнопку или напиши текст.\nКоманды: /ping /reset",
-        reply_markup=main_keyboard()
+        reply_markup=build_main_menu()
     )
 
-# ====== /ping ======
 @bot.message_handler(commands=['ping'])
 def cmd_ping(m):
-    bot.reply_to(m, "pong")
+    bot.send_message(m.chat.id, "pong")
 
-# ====== /reset ======
 @bot.message_handler(commands=['reset'])
 def cmd_reset(m):
     history[m.from_user.id] = []
-    bot.reply_to(m, "Контекст очищен.", reply_markup=main_keyboard())
+    user_state[m.from_user.id] = {"flow": None, "step": 0, "data": {}}
+    bot.send_message(m.chat.id, "Контекст очищен.", reply_markup=build_main_menu())
 
-# ====== Хелперы-ответы на жёсткие кнопки ======
-def reply_passport_intro() -> str:
-    return (
-        "<b>Паспорт трейдера</b>\n"
-        "Ответь по пунктам, можно списком 1–6:\n\n"
-        "1) На каких рынках/инструментах торгуешь?\n"
-        "2) Таймфреймы (рабочий / старший контекст)?\n"
-        "3) Базовый подход (тренд/средний/контртренд), стиль (дейтрейд/свинг)?\n"
-        "4) Риск-профиль (риски на сделку/день, просадка-лимиты)?\n"
-        "5) Ключевые триггеры стресса (твои «сигналы тревоги»)?\n"
-        "6) Ритуалы до/во время/после сессии (коротко)."
-    )
-
-def reply_week_panel_template() -> str:
-    today = datetime.utcnow().strftime('%d.%m')
-    return (
-        f"<b>Панель недели</b> (неделя от {today})\n"
-        "Ответь кратко 1–5:\n\n"
-        "1) <b>Фокус недели (узел)</b>: одна тема/ошибка/навык (например: «не пересиживать стоп»).\n"
-        "2) <b>Лимиты</b>: риск на день/неделю, дневной стоп, макс. число сделок.\n"
-        "3) <b>Ритуалы</b>: чек входа, дыхание, пауза после стопа, финальный разбор.\n"
-        "4) <b>План</b>: 2–4 конкретных шага на неделю (что и когда делаешь).\n"
-        "5) <b>Мини-ретро</b> (в конце недели): 3 факта → 1 вывод → 1 улучшение.\n\n"
-        "Готов? Напиши ответы подряд (1–5)."
-    )
-
-def reply_error_intro() -> str:
-    return (
-        "<b>Разбор ошибки (мини-MERCEDES + TOTE)</b>\n"
-        "Отправь 1–6:\n"
-        "1) Ситуация/контекст (что произошло?)\n"
-        "2) Мысли/интерпретации (M)\n"
-        "3) Эмоции/физиология (E)\n"
-        "4) Реакции/действия (R/C)\n"
-        "5) Результат (S)\n"
-        "6) TOTE: цель → тест → операция → выход (что меняем в следующий раз?)"
-    )
-
-def reply_strategy_intro() -> str:
-    return (
-        "<b>Стратегия/ТС</b>\n"
-        "Давай зафиксируем основу:\n"
-        "1) Подход и рынок (что, где, когда)\n"
-        "2) Вход: условия/сигналы\n"
-        "3) Стоп и сопровождение\n"
-        "4) Выход/таргеты\n"
-        "5) Риск (на сделку/день)\n"
-        "Ответь 1–5 — сделаем черновик ТС."
-    )
-
-def reply_materials_hint() -> str:
-    return (
-        "<b>Материалы Innertrade</b>\n"
-        "• MERCEDES и TOTE — краткая теория\n"
-        "• Архетипы/роли трейдера — таблица\n"
-        "• Сборка ТС: конструктор + чек-листы\n"
-        "• Риск-менеджмент: уровни и лимиты\n"
-        "Напиши, что открыть: «mercedes», «tote», «архетипы», «конструктор ТС», «риск»."
-    )
-
-def reply_progress_hint() -> str:
-    return (
-        "<b>Мой прогресс</b>\n"
-        "Могу подсказать, что уже зафиксировано за сессию (ошибки/шаблоны/планы).\n"
-        "Напиши: «показать прогресс» или уточни, что именно вывести."
-    )
-
-# ====== Кнопки (строгое соответствие тексту) ======
-BUTTONS = {
-    "Ошибка": "ERROR",
-    "Стратегия": "STRAT",
-    "Поговорим": "CHAT",
-    "Паспорт": "PASSPORT",
-    "Панель недели": "WEEK",
-    "Материалы": "MATS",
-    "Прогресс": "PROGRESS",
-    "Сброс": "RESET_BTN",
+# ====== Кнопки (интенты) ======
+INTENT_ALIASES = {
+    "Ошибка": "error",
+    "ТС / Стратегия": "ts",
+    "Паспорт": "passport",
+    "Панель недели": "weekly",
+    "Материалы": "materials",
+    "Прогресс": "progress",
+    "Профиль": "profile",
+    "Сброс": "reset_btn",
 }
 
-@bot.message_handler(func=lambda m: (m.text or "").strip() in BUTTONS.keys())
-def on_buttons(m):
+@bot.message_handler(func=lambda m: (m.text or "").strip() in INTENT_ALIASES.keys())
+def on_intent_button(m):
+    uid = m.from_user.id
+    t = (m.text or "").strip()
+    intent = INTENT_ALIASES[t]
+
+    if intent == "reset_btn":
+        history[uid] = []
+        user_state[uid] = {"flow": None, "step": 0, "data": {}}
+        bot.send_message(m.chat.id, "Контекст очищен. Выбери пункт меню.", reply_markup=build_main_menu())
+        return
+
+    if intent == "passport":
+        reply = start_passport(uid)
+        send_long(m.chat.id, reply)
+        return
+
+    if intent == "weekly":
+        reply = start_weekly(uid)
+        send_long(m.chat.id, reply)
+        return
+
+    if intent == "error":
+        reply = start_error(uid)
+        send_long(m.chat.id, reply)
+        return
+
+    if intent == "ts":
+        # лёгкий вход в сценарий ТС — пока просто подсказка (будет расширяться)
+        send_long(m.chat.id, "Хочешь собрать/пересобрать ТС. С чего начнём: подход/таймфреймы, вход/выход или риск?")
+        return
+
+    if intent == "materials":
+        send_long(m.chat.id, "Материалы: MERCEDES, TOTE, архетипы, ограничивающие убеждения, базовая ТС, риск-менеджмент и пр. (каталог скоро будет в меню).")
+        return
+
+    if intent == "progress":
+        send_long(m.chat.id, "Раздел «Прогресс»: скоро покажу % выполнения ритуалов, число нарушений лимитов и активные узлы недели.")
+        return
+
+    if intent == "profile":
+        send_long(m.chat.id, "Профиль: паспорт, стиль, часы торговли, ограничения. (Пока храню локально, БД подключим — буду помнить между сессиями.)")
+        return
+
+# ====== Текущие пошаговые сценарии ======
+@bot.message_handler(func=lambda m: True)
+def on_text(m):
     uid = m.from_user.id
     text = (m.text or "").strip()
-    kind = BUTTONS[text]
-    log.info(f"Button pressed: {text} → {kind}")
+    st = user_state.get(uid, {"flow": None, "step": 0, "data": {}})
 
-    if kind == "RESET_BTN":
-        history[uid] = []
-        bot.reply_to(m, "Контекст очищен. Выбери действие.", reply_markup=main_keyboard())
+    # если пользователь в сценарии — продолжаем его
+    if st.get("flow") == "passport":
+        reply = continue_passport(uid, text)
+        send_long(m.chat.id, reply)
         return
 
-    if kind == "PASSPORT":
-        send_long(m.chat.id, reply_passport_intro(), reply_to=m.message_id)
+    if st.get("flow") == "weekly":
+        reply = continue_weekly(uid, text)
+        send_long(m.chat.id, reply)
         return
 
-    if kind == "WEEK":
-        send_long(m.chat.id, reply_week_panel_template(), reply_to=m.message_id)
+    if st.get("flow") == "error":
+        reply = continue_error(uid, text)
+        send_long(m.chat.id, reply)
         return
 
-    if kind == "ERROR":
-        send_long(m.chat.id, reply_error_intro(), reply_to=m.message_id)
-        return
-
-    if kind == "STRAT":
-        send_long(m.chat.id, reply_strategy_intro(), reply_to=m.message_id)
-        return
-
-    if kind == "MATS":
-        send_long(m.chat.id, reply_materials_hint(), reply_to=m.message_id)
-        return
-
-    if kind == "PROGRESS":
-        send_long(m.chat.id, reply_progress_hint(), reply_to=m.message_id)
-        return
-
-    # Fallback – если вдруг что-то новое
+    # иначе — обычный GPT
     try:
         reply = ask_gpt(uid, text)
     except Exception as e:
         reply = f"Ошибка GPT: {e}"
-    send_long(m.chat.id, reply, reply_to=m.message_id)
-
-# ====== Любой другой текст → GPT ======
-@bot.message_handler(func=lambda _: True)
-def on_text(m):
-    uid = m.from_user.id
-    try:
-        reply = ask_gpt(uid, m.text or "")
-    except Exception as e:
-        reply = f"Ошибка GPT: {e}"
-    # Без «reply_to», чтобы не было «ответа на сообщение пользователя»
     send_long(m.chat.id, reply)
 
 if __name__ == "__main__":
-    log.info("Starting keepalive web server…")
-    # Render будет звать /health периодически; Flask слушает параллельно
+    # снимаем вебхук и запускаем polling + веб-сервер для /health
+    try:
+        bot.remove_webhook()
+        logging.info("Webhook removed (ok)")
+    except Exception as e:
+        logging.warning(f"Webhook remove warn: {e}")
+
     import threading
     def run_flask():
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), debug=False)
-    threading.Thread(target=run_flask, daemon=True).start()
+        logging.info("Starting keepalive web server…")
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
-    log.info("Starting polling…")
+    threading.Thread(target=run_flask, daemon=True).start()
+    logging.info("Starting polling…")
     bot.infinity_polling(none_stop=True, timeout=60, long_polling_timeout=60)
