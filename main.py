@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from flask import Flask, jsonify
 from telebot import TeleBot, types
 from openai import OpenAI
@@ -19,7 +20,7 @@ if not TELEGRAM_TOKEN:
 if not OPENAI_API_KEY:
     raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
 
-# ---------- OPENAI (пока не используется, но оставим) ----------
+# ---------- OPENAI ----------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------- DB (опционально) ----------
@@ -54,10 +55,50 @@ def save_state(user_id: int, intent: str, data: dict | None = None):
                 data   = EXCLUDED.data
         """), {"uid": user_id, "intent": intent, "data": data})
 
+# ---------- НОРМАЛИЗАЦИЯ ТЕКСТА ----------
+EMOJI_RE = re.compile(r"[\u2600-\u27BF\U0001F300-\U0001FAFF\uFE0F]")  # эмодзи + var selector
+
+def norm(s: str) -> str:
+    if not s:
+        return ""
+    s = EMOJI_RE.sub("", s)          # убрать эмодзи/вариант-селекторы
+    s = s.replace("ё", "е")
+    s = s.strip().lower()
+    return s
+
+# Карта интентов: ключи — варианты фраз без эмодзи
+INTENT_ALIASES = {
+    "error": [
+        "у меня ошибка", "ошибка", "разбор ошибки", "mercedes", "мерседес", "mercedes tote", "tote"
+    ],
+    "strategy": [
+        "хочу стратегию", "стратегия", "собрать тс", "конструктор тс"
+    ],
+    "passport": [
+        "паспорт", "паспорт трейдера", "профиль", "анкета"
+    ],
+    "week_panel": [
+        "панель недели", "неделя", "фокус недели", "weekly"
+    ],
+    "panic": [
+        "экстренно: поплыл", "экстренно", "поплыл", "паника", "стоп-протокол"
+    ],
+    "start_help": [
+        "не знаю, с чего начать", "с чего начать", "начать", "помоги начать"
+    ],
+}
+
+def detect_intent(txt: str) -> str | None:
+    t = norm(txt)
+    for intent, variants in INTENT_ALIASES.items():
+        for v in variants:
+            if t == v or t.startswith(v):
+                return intent
+    return None
+
 # ---------- TELEGRAM ----------
 bot = TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
 
-# Клавиатура главного меню
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🚑 У меня ошибка", "🧩 Хочу стратегию")
@@ -65,17 +106,11 @@ def main_menu():
     kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
     return kb
 
-# Нормализация текста для матчинга
-def norm(s: str) -> str:
-    return (s or "").strip().lower().replace("ё", "е")
-
-# /start, /menu, /reset
 @bot.message_handler(commands=["start", "menu", "reset"])
 def cmd_start(m):
-    logging.info(f"/start|/menu|/reset from {m.from_user.id}")
     bot.send_message(
         m.chat.id,
-        "👋 Привет! Я ИИ-наставник *Innertrade*.\nВыбери кнопку или напиши текст.\nКоманды: /ping /echo",
+        "👋 Привет! Я ИИ-наставник *Innertrade*.\nВыбери кнопку или напиши текст.\nКоманды: /ping /reset",
         reply_markup=main_menu()
     )
     save_state(m.from_user.id, intent="idle")
@@ -84,81 +119,95 @@ def cmd_start(m):
 def cmd_ping(m):
     bot.send_message(m.chat.id, "pong")
 
-@bot.message_handler(commands=["echo"])
-def cmd_echo(m):
-    # покажем «сырое» содержимое на всякий случай
-    bot.send_message(m.chat.id, f"Текст, который получил:\n`{m.text}`", parse_mode="Markdown")
+# ---------- ХЕНДЛЕРЫ С ЯВНЫМИ КНОПКАМИ (оставляем на всякий) ----------
+@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("У меня ошибка")])
+def intent_error_btn(m): return intent_error(m)
 
-# ---------- ЕДИНЫЙ РОУТЕР ПО ТЕКСТУ ----------
+@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Хочу стратегию")])
+def intent_strategy_btn(m): return intent_strategy(m)
+
+@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Паспорт")])
+def intent_passport_btn(m): return intent_passport(m)
+
+@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Панель недели")])
+def intent_week_panel_btn(m): return intent_week_panel(m)
+
+@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Экстренно: поплыл")])
+def intent_panic_btn(m): return intent_panic(m)
+
+@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Не знаю, с чего начать")])
+def intent_start_help_btn(m): return intent_start_help(m)
+
+# ---------- ОСНОВНЫЕ ОБРАБОТЧИКИ ИНТЕНТОВ ----------
+def intent_error(m):
+    save_state(m.from_user.id, "error")
+    bot.send_message(
+        m.chat.id,
+        "Давай разберём через *MERCEDES + TOTE*.\n\n"
+        "*M* Мотивация?\n*E* Эмоции?\n*R* Результат?\n*C* Контекст?\n*E* Эффект?\n*D* Действия?\n*S* Стратегия?\n\n"
+        "*T* Test — что пошло не так?\n*O* Operate — что сделал?\n*T* Test — результат?\n*E* Evolve — что изменишь?",
+        reply_markup=main_menu()
+    )
+
+def intent_strategy(m):
+    save_state(m.from_user.id, "strategy")
+    bot.send_message(
+        m.chat.id,
+        "Ок, собираем ТС по конструктору:\n"
+        "1) Цели\n2) Стиль (дневной/свинг/позиционный)\n"
+        "3) Рынки/инструменты\n4) Правила входа/выхода\n"
+        "5) Риск (%, стоп)\n6) Сопровождение\n7) Тестирование (история/демо)",
+        reply_markup=main_menu()
+    )
+
+def intent_passport(m):
+    save_state(m.from_user.id, "passport")
+    bot.send_message(
+        m.chat.id,
+        "Паспорт трейдера. 1/6) На каких рынках/инструментах торгуешь?",
+        reply_markup=main_menu()
+    )
+
+def intent_week_panel(m):
+    save_state(m.from_user.id, "week_panel")
+    bot.send_message(
+        m.chat.id,
+        "Панель недели:\n• Фокус недели\n• План (3 шага)\n• Лимиты\n• Ритуалы\n• Короткая ретро в конце недели",
+        reply_markup=main_menu()
+    )
+
+def intent_panic(m):
+    save_state(m.from_user.id, "panic")
+    bot.send_message(
+        m.chat.id,
+        "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) 10 медленных вдохов\n"
+        "4) Запиши триггер (что именно выбило)\n5) Вернись к плану сделки или закрой позицию по правилу",
+        reply_markup=main_menu()
+    )
+
+def intent_start_help(m):
+    save_state(m.from_user.id, "start_help")
+    bot.send_message(
+        m.chat.id,
+        "Предлагаю так:\n1) Заполним паспорт (1–2 мин)\n2) Выберем фокус недели\n3) Соберём скелет ТС\n"
+        "С чего начнём — паспорт или фокус недели?",
+        reply_markup=main_menu()
+    )
+
+# ---------- ROUTER ПО ТЕКСТУ ----------
 @bot.message_handler(content_types=["text"])
-def route_text(m):
-    raw = m.text or ""
-    logging.info(f"IN [{m.from_user.id}]: {repr(raw)}")
-    n = norm(raw)
+def router(m):
+    # логируем сырое содержимое
+    logging.info(f"Got text: {repr(m.text)} from {m.from_user.id}")
+    intent = detect_intent(m.text or "")
+    if intent == "error":        return intent_error(m)
+    if intent == "strategy":     return intent_strategy(m)
+    if intent == "passport":     return intent_passport(m)
+    if intent == "week_panel":   return intent_week_panel(m)
+    if intent == "panic":        return intent_panic(m)
+    if intent == "start_help":   return intent_start_help(m)
 
-    # Без эмодзи, только ключевая фраза
-    if "у меня ошибка" in n:
-        save_state(m.from_user.id, "error")
-        bot.send_message(
-            m.chat.id,
-            "Давай разберём через *MERCEDES + TOTE*.\n\n"
-            "*M* Мотивация?\n*E* Эмоции?\n*R* Результат?\n*C* Контекст?\n*E* Эффект?\n*D* Действия?\n*S* Стратегия?\n\n"
-            "*T* Test — что пошло не так?\n*O* Operate — что сделал?\n*T* Test — результат?\n*E* Evolve — что изменишь?",
-            reply_markup=main_menu()
-        )
-        return
-
-    if "хочу стратегию" in n:
-        save_state(m.from_user.id, "strategy")
-        bot.send_message(
-            m.chat.id,
-            "Ок, собираем ТС по конструктору:\n"
-            "1) Цели\n2) Стиль (дневной/свинг/позиционный)\n"
-            "3) Рынки/инструменты\n4) Правила входа/выхода\n"
-            "5) Риск (%, стоп)\n6) Сопровождение\n7) Тестирование (история/демо)",
-            reply_markup=main_menu()
-        )
-        return
-
-    if "паспорт" in n:
-        save_state(m.from_user.id, "passport")
-        bot.send_message(
-            m.chat.id,
-            "Паспорт трейдера. 1/6) На каких рынках/инструментах торгуешь?",
-            reply_markup=main_menu()
-        )
-        return
-
-    if "панел" in n and "недел" in n:  # ловим «панель недели»
-        save_state(m.from_user.id, "week_panel")
-        bot.send_message(
-            m.chat.id,
-            "Панель недели:\n• Фокус недели\n• План (3 шага)\n• Лимиты\n• Ритуалы\n• Короткая ретро в конце недели",
-            reply_markup=main_menu()
-        )
-        return
-
-    if "экстренно" in n or "поплыл" in n:
-        save_state(m.from_user.id, "panic")
-        bot.send_message(
-            m.chat.id,
-            "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) 10 медленных вдохов\n"
-            "4) Запиши триггер (что выбило)\n5) Вернись к плану или закрой позицию по правилу",
-            reply_markup=main_menu()
-        )
-        return
-
-    if "не знаю" in n and "с чего начать" in n:
-        save_state(m.from_user.id, "start_help")
-        bot.send_message(
-            m.chat.id,
-            "Предлагаю так:\n1) Заполним паспорт (1–2 мин)\n2) Выберем фокус недели\n3) Соберём скелет ТС\n"
-            "С чего начнём — паспорт или фокус недели?",
-            reply_markup=main_menu()
-        )
-        return
-
-    # Фолбэк
+    # фолбэк
     bot.send_message(
         m.chat.id,
         "Принял. Чтобы было быстрее, выбери пункт в меню ниже или напиши /menu.",
@@ -183,14 +232,12 @@ def start_polling():
     except Exception as e:
         logging.warning(f"Webhook remove warn: {e}")
     logging.info("Starting polling…")
-    # важные параметры: увеличенный timeout и пропуск накопившихся апдейтов
     bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
 
 if __name__ == "__main__":
     import threading
     t = threading.Thread(target=start_polling, daemon=True)
     t.start()
-
     port = int(os.getenv("PORT", "10000"))
     logging.info("Starting keepalive web server…")
     app.run(host="0.0.0.0", port=port)
