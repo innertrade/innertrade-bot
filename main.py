@@ -20,20 +20,20 @@ if not TELEGRAM_TOKEN:
 if not OPENAI_API_KEY:
     raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
 
-# ---------- OPENAI ----------
+# ---------- OPENAI (на будущее) ----------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- DB (опционально) ----------
+# ---------- DB ----------
 engine = None
 if DATABASE_URL:
     try:
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS user_state (
                 user_id BIGINT PRIMARY KEY,
-                intent TEXT,
-                data JSONB
+                intent  TEXT,
+                data    JSONB
             );
             """))
         logging.info("DB connected & migrated")
@@ -55,50 +55,10 @@ def save_state(user_id: int, intent: str, data: dict | None = None):
                 data   = EXCLUDED.data
         """), {"uid": user_id, "intent": intent, "data": data})
 
-# ---------- НОРМАЛИЗАЦИЯ ТЕКСТА ----------
-EMOJI_RE = re.compile(r"[\u2600-\u27BF\U0001F300-\U0001FAFF\uFE0F]")  # эмодзи + var selector
-
-def norm(s: str) -> str:
-    if not s:
-        return ""
-    s = EMOJI_RE.sub("", s)          # убрать эмодзи/вариант-селекторы
-    s = s.replace("ё", "е")
-    s = s.strip().lower()
-    return s
-
-# Карта интентов: ключи — варианты фраз без эмодзи
-INTENT_ALIASES = {
-    "error": [
-        "у меня ошибка", "ошибка", "разбор ошибки", "mercedes", "мерседес", "mercedes tote", "tote"
-    ],
-    "strategy": [
-        "хочу стратегию", "стратегия", "собрать тс", "конструктор тс"
-    ],
-    "passport": [
-        "паспорт", "паспорт трейдера", "профиль", "анкета"
-    ],
-    "week_panel": [
-        "панель недели", "неделя", "фокус недели", "weekly"
-    ],
-    "panic": [
-        "экстренно: поплыл", "экстренно", "поплыл", "паника", "стоп-протокол"
-    ],
-    "start_help": [
-        "не знаю, с чего начать", "с чего начать", "начать", "помоги начать"
-    ],
-}
-
-def detect_intent(txt: str) -> str | None:
-    t = norm(txt)
-    for intent, variants in INTENT_ALIASES.items():
-        for v in variants:
-            if t == v or t.startswith(v):
-                return intent
-    return None
-
 # ---------- TELEGRAM ----------
 bot = TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
 
+# Главное меню
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🚑 У меня ошибка", "🧩 Хочу стратегию")
@@ -106,6 +66,7 @@ def main_menu():
     kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
     return kb
 
+# /start, /menu, /reset
 @bot.message_handler(commands=["start", "menu", "reset"])
 def cmd_start(m):
     bot.send_message(
@@ -119,31 +80,12 @@ def cmd_start(m):
 def cmd_ping(m):
     bot.send_message(m.chat.id, "pong")
 
-# ---------- ХЕНДЛЕРЫ С ЯВНЫМИ КНОПКАМИ (оставляем на всякий) ----------
-@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("У меня ошибка")])
-def intent_error_btn(m): return intent_error(m)
-
-@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Хочу стратегию")])
-def intent_strategy_btn(m): return intent_strategy(m)
-
-@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Паспорт")])
-def intent_passport_btn(m): return intent_passport(m)
-
-@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Панель недели")])
-def intent_week_panel_btn(m): return intent_week_panel(m)
-
-@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Экстренно: поплыл")])
-def intent_panic_btn(m): return intent_panic(m)
-
-@bot.message_handler(func=lambda msg: norm(msg.text) in [norm("Не знаю, с чего начать")])
-def intent_start_help_btn(m): return intent_start_help(m)
-
-# ---------- ОСНОВНЫЕ ОБРАБОТЧИКИ ИНТЕНТОВ ----------
+# ---------- ИНТЕНТЫ ----------
 def intent_error(m):
     save_state(m.from_user.id, "error")
     bot.send_message(
         m.chat.id,
-        "Давай разберём через *MERCEDES + TOTE*.\n\n"
+        "Разберём через *MERCEDES + TOTE*.\n\n"
         "*M* Мотивация?\n*E* Эмоции?\n*R* Результат?\n*C* Контекст?\n*E* Эффект?\n*D* Действия?\n*S* Стратегия?\n\n"
         "*T* Test — что пошло не так?\n*O* Operate — что сделал?\n*T* Test — результат?\n*E* Evolve — что изменишь?",
         reply_markup=main_menu()
@@ -180,8 +122,13 @@ def intent_panic(m):
     save_state(m.from_user.id, "panic")
     bot.send_message(
         m.chat.id,
-        "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) 10 медленных вдохов\n"
-        "4) Запиши триггер (что именно выбило)\n5) Вернись к плану сделки или закрой позицию по правилу",
+        "🛑 Стоп-протокол «поплыл»:\n"
+        "1) Пауза 2 мин\n"
+        "2) Закрой график/терминал\n"
+        "3) 10 медленных вдохов\n"
+        "4) Запиши триггер: *что* выбило\n"
+        "5) Действуй по плану сделки или закрой по правилу\n"
+        "_Вернись к лимитам и чек-листу перед следующим входом_",
         reply_markup=main_menu()
     )
 
@@ -194,20 +141,63 @@ def intent_start_help(m):
         reply_markup=main_menu()
     )
 
-# ---------- ROUTER ПО ТЕКСТУ ----------
-@bot.message_handler(content_types=["text"])
-def router(m):
-    # логируем сырое содержимое
-    logging.info(f"Got text: {repr(m.text)} from {m.from_user.id}")
-    intent = detect_intent(m.text or "")
-    if intent == "error":        return intent_error(m)
-    if intent == "strategy":     return intent_strategy(m)
-    if intent == "passport":     return intent_passport(m)
-    if intent == "week_panel":   return intent_week_panel(m)
-    if intent == "panic":        return intent_panic(m)
-    if intent == "start_help":   return intent_start_help(m)
+# ---------- ХЕНДЛЕРЫ ДЛЯ КНОПОК ----------
+@bot.message_handler(func=lambda msg: msg.text == "🚑 У меня ошибка")
+def intent_error_btn(m): intent_error(m)
 
-    # фолбэк
+@bot.message_handler(func=lambda msg: msg.text == "🧩 Хочу стратегию")
+def intent_strategy_btn(m): intent_strategy(m)
+
+@bot.message_handler(func=lambda msg: msg.text == "📄 Паспорт")
+def intent_passport_btn(m): intent_passport(m)
+
+@bot.message_handler(func=lambda msg: msg.text == "🗒 Панель недели")
+def intent_week_panel_btn(m): intent_week_panel(m)
+
+@bot.message_handler(func=lambda msg: msg.text == "🆘 Экстренно: поплыл")
+def intent_panic_btn(m): intent_panic(m)
+
+@bot.message_handler(func=lambda msg: msg.text == "🤔 Не знаю, с чего начать")
+def intent_start_help_btn(m): intent_start_help(m)
+
+# ---------- УМНЫЙ РОУТЕР ДЛЯ СВОБОДНОГО ТЕКСТА ----------
+def detect_intent(text: str) -> str | None:
+    t = text.lower()
+    # убрать лишние пробелы и базовую пунктуацию
+    t = re.sub(r"[^\w\sёа-я-]", " ", t)  # простая очистка
+    t = re.sub(r"\s+", " ", t).strip()
+
+    if any(k in t for k in ["поплыл", "паника", "panic", "экстренн"]):
+        return "panic"
+    if any(k in t for k in ["ошибк"]):  # ошибка/ошибку/ошибки
+        return "error"
+    if any(k in t for k in ["стратег"]):
+        return "strategy"
+    if any(k in t for k in ["паспорт"]):
+        return "passport"
+    if any(k in t for k in ["панел", "недел"]):
+        return "week_panel"
+    if any(k in t for k in ["не знаю", "с чего начать", "начать не знаю"]):
+        return "start_help"
+    return None
+
+@bot.message_handler(content_types=["text"])
+def router_or_fallback(m):
+    intent = detect_intent(m.text or "")
+    if intent == "panic":
+        return intent_panic(m)
+    if intent == "error":
+        return intent_error(m)
+    if intent == "strategy":
+        return intent_strategy(m)
+    if intent == "passport":
+        return intent_passport(m)
+    if intent == "week_panel":
+        return intent_week_panel(m)
+    if intent == "start_help":
+        return intent_start_help(m)
+
+    # Фолбэк — если ничего не распознали
     bot.send_message(
         m.chat.id,
         "Принял. Чтобы было быстрее, выбери пункт в меню ниже или напиши /menu.",
