@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from flask import Flask, jsonify
 from telebot import TeleBot, types
@@ -65,6 +66,36 @@ def main_menu():
     kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
     return kb
 
+# Нормализация текста: убираем эмодзи/служебные символы/дубликаты пробелов
+EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF\U0001F1E6-\U0001F1FF]+")
+def norm(txt: str) -> str:
+    if not txt:
+        return ""
+    t = EMOJI_RE.sub(" ", txt)
+    t = t.replace("—", "-").replace("–", "-")
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t
+
+# Карта интентов по ключевым фразам БЕЗ эмодзи
+INTENT_MAP = {
+    "у меня ошибка": "error",
+    "хочу стратегию": "strategy",
+    "паспорт": "passport",
+    "панель недели": "week_panel",
+    "экстренно: поплыл": "panic",
+    "экстренно поплыл": "panic",
+    "не знаю, с чего начать": "start_help",
+    "не знаю с чего начать": "start_help",
+}
+
+def detect_intent(text: str) -> str | None:
+    t = norm(text)
+    logging.info(f"RAW text: {repr(text)} | normalized: {t}")
+    for k, intent in INTENT_MAP.items():
+        if k in t:
+            return intent
+    return None
+
 # /start и меню
 @bot.message_handler(commands=["start", "menu", "reset"])
 def cmd_start(m):
@@ -79,95 +110,84 @@ def cmd_start(m):
 def cmd_ping(m):
     bot.send_message(m.chat.id, "pong")
 
-# ---------- РОУТЕР ТЕКСТОВ ----------
-def detect_intent(text: str) -> str | None:
-    if not text:
-        return None
-    s = text.lower().strip()
-    # Основные интенты по ключевым словам (без жёстких эмодзи/пробелов)
-    if "ошиб" in s:
-        return "error"
-    if "стратег" in s:
-        return "strategy"
-    if "паспорт" in s:
-        return "passport"
-    if "панел" in s or "недел" in s:
-        return "week_panel"
-    if "экстр" in s or "поплыл" in s or "паника" in s:
-        return "panic"
-    if "не знаю" in s or "с чего начать" in s or "начать" == s:
-        return "start_help"
-    return None
-
-def reply_for_intent(chat_id: int, user_id: int, intent: str):
+# ---------- ОБРАБОТЧИК ВСЕХ ТЕКСТОВ (одна точка входа) ----------
+@bot.message_handler(content_types=["text"])
+def handle_text(m):
+    intent = detect_intent(m.text or "")
     if intent == "error":
-        save_state(user_id, "error")
+        save_state(m.from_user.id, "error")
         bot.send_message(
-            chat_id,
+            m.chat.id,
             "Давай разберём через *MERCEDES + TOTE*.\n\n"
             "*M* Мотивация?\n*E* Эмоции?\n*R* Результат?\n*C* Контекст?\n*E* Эффект?\n*D* Действия?\n*S* Стратегия?\n\n"
             "*T* Test — что пошло не так?\n*O* Operate — что сделал?\n*T* Test — результат?\n*E* Evolve — что изменишь?",
             reply_markup=main_menu()
         )
-    elif intent == "strategy":
-        save_state(user_id, "strategy")
+        return
+
+    if intent == "strategy":
+        save_state(m.from_user.id, "strategy")
         bot.send_message(
-            chat_id,
+            m.chat.id,
             "Ок, собираем ТС по конструктору:\n"
             "1) Цели\n2) Стиль (дневной/свинг/позиционный)\n"
             "3) Рынки/инструменты\n4) Правила входа/выхода\n"
             "5) Риск (%, стоп)\n6) Сопровождение\n7) Тестирование (история/демо)",
             reply_markup=main_menu()
         )
-    elif intent == "passport":
-        save_state(user_id, "passport")
+        return
+
+    if intent == "passport":
+        save_state(m.from_user.id, "passport")
         bot.send_message(
-            chat_id,
+            m.chat.id,
             "Паспорт трейдера. 1/6) На каких рынках/инструментах торгуешь?",
             reply_markup=main_menu()
         )
-    elif intent == "week_panel":
-        save_state(user_id, "week_panel")
+        return
+
+    if intent == "week_panel":
+        save_state(m.from_user.id, "week_panel")
         bot.send_message(
-            chat_id,
+            m.chat.id,
             "Панель недели:\n• Фокус недели\n• План (3 шага)\n• Лимиты\n• Ритуалы\n• Короткая ретро в конце недели",
             reply_markup=main_menu()
         )
-    elif intent == "panic":
-        save_state(user_id, "panic")
+        return
+
+    if intent == "panic":
+        save_state(m.from_user.id, "panic")
         bot.send_message(
-            chat_id,
+            m.chat.id,
             "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) Сделай 10 медленных вдохов\n"
             "4) Запиши триггер (что именно выбило)\n5) Вернись к плану сделки или закрой позицию по правилу",
             reply_markup=main_menu()
         )
-    elif intent == "start_help":
-        save_state(user_id, "start_help")
+        return
+
+    if intent == "start_help":
+        save_state(m.from_user.id, "start_help")
         bot.send_message(
-            chat_id,
+            m.chat.id,
             "Предлагаю так:\n1) Заполним паспорт (1–2 мин)\n2) Выберем фокус недели\n3) Соберём скелет ТС\n"
             "С чего начнём — паспорт или фокус недели?",
             reply_markup=main_menu()
         )
-    else:
-        bot.send_message(
-            chat_id,
-            "Принял. Чтобы было быстрее, выбери пункт в меню ниже или напиши /menu.",
-            reply_markup=main_menu()
-        )
+        return
 
-@bot.message_handler(content_types=["text"])
-def text_router(m):
-    logging.info(f"TEXT from {m.from_user.id}: {repr(m.text)}")
-    intent = detect_intent(m.text or "")
-    reply_for_intent(m.chat.id, m.from_user.id, intent if intent else "")
+    # Фолбэк на произвольный текст
+    bot.send_message(
+        m.chat.id,
+        "Принял. Чтобы было быстрее, выбери пункт в меню ниже или напиши /menu.",
+        reply_markup=main_menu()
+    )
 
 # ---------- KEEPALIVE для Render ----------
 app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return "OK v5"
+    return "OK v6"
 
 @app.route("/health")
 def health():
@@ -180,12 +200,14 @@ def start_polling():
     except Exception as e:
         logging.warning(f"Webhook remove warn: {e}")
     logging.info("Starting polling…")
+    # skip_pending=True — чтобы не разматывать старые очереди
     bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
 
 if __name__ == "__main__":
     import threading
     t = threading.Thread(target=start_polling, daemon=True)
     t.start()
+
     port = int(os.getenv("PORT", "10000"))
     logging.info("Starting keepalive web server…")
     app.run(host="0.0.0.0", port=port)
