@@ -1,260 +1,183 @@
 import os
 import logging
-from datetime import datetime
-from typing import Dict, Any
-
-import telebot
-from telebot import types
-
 from flask import Flask, jsonify
+from telebot import TeleBot, types
 from openai import OpenAI
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
-# ====== ENV ======
+# ---------- ЛОГИ ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+# ---------- ENV ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL   = os.getenv("DATABASE_URL")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Нет TELEGRAM_TOKEN в Secrets")
-if not OPENAI_KEY:
+if not OPENAI_API_KEY:
     raise RuntimeError("Нет OPENAI_API_KEY в Secrets")
 
-# ====== GPT client ======
-client = OpenAI(api_key=OPENAI_KEY)
+# ---------- OPENAI ----------
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== LOGS ======
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+# ---------- DB (опционально) ----------
+engine = None
+if DATABASE_URL:
+    try:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        with engine.connect() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS user_state (
+                user_id BIGINT PRIMARY KEY,
+                intent TEXT,
+                data JSONB
+            );
+            """))
+        logging.info("DB connected & migrated")
+    except OperationalError as e:
+        logging.warning(f"DB not available yet: {e}")
+        engine = None
+else:
+    logging.info("DATABASE_URL не задан — работаем без БД")
 
-# ====== BOT ======
-bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
+def save_state(user_id: int, intent: str, data: dict | None = None):
+    if not engine:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO user_state (user_id, intent, data)
+            VALUES (:uid, :intent, COALESCE(:data, '{}'::jsonb))
+            ON CONFLICT (user_id) DO UPDATE
+            SET intent = EXCLUDED.intent,
+                data   = EXCLUDED.data
+        """), {"uid": user_id, "intent": intent, "data": data})
 
-# Снимаем возможный webhook
-try:
-    bot.remove_webhook()
-    logging.info("Webhook removed (ok)")
-except Exception as e:
-    logging.warning(f"Webhook remove warn: {e}")
+# ---------- TELEGRAM ----------
+bot = TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
 
-# ====== STATE (память в ОЗУ; БД подключим позже) ======
-user_state: Dict[int, Dict[str, Any]] = {}  # {uid: {mode: ..., data:{...}, step:int}}
-
-# ====== Клавиатура ======
-def main_kb():
+# Клавиатура главного меню
+def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(types.KeyboardButton("Ошибка"), types.KeyboardButton("Хочу стратегию"), types.KeyboardButton("Поговорим"))
-    kb.row(types.KeyboardButton("Паспорт"), types.KeyboardButton("Панель недели"))
-    kb.row(types.KeyboardButton("Мой прогресс"), types.KeyboardButton("Материалы"), types.KeyboardButton("Сброс"))
+    kb.row("🚑 У меня ошибка", "🧩 Хочу стратегию")
+    kb.row("📄 Паспорт", "🗒 Панель недели")
+    kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
     return kb
 
-# ====== Общий "курсовый" системный контекст для GPT ======
-COURSE_SYSTEM = (
-    "Ты — ИИ-наставник Innertrade. Работай строго по курсу: психология трейдинга (MERCEDES, TOTE), "
-    "архетипы/роли, чек-листы, ритуалы, конструктор ТС. Отвечай кратко и предметно, давай шаги и мини-чек-листы. "
-    "Если спрашивают про «ошибку» — запускай мини-разбор через MERCEDES+TOTE. Если «хочу стратегию» — веди по "
-    "конструктору ТС: цели, стиль, рынок, вход/выход, риски, правила сопровождения, тестирование. Если «поговорим» — "
-    "держи беседу в русле психологии и системности трейдинга."
-)
-
-def ask_gpt_course(user_text: str, history: list = None) -> str:
-    # Простой одноходовый вызов с "жёстким" системным сообщением.
-    msgs = [{"role": "system", "content": COURSE_SYSTEM}]
-    if history:
-        msgs.extend(history)
-    msgs.append({"role": "user", "content": user_text})
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.4,
-        messages=msgs
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-def send_long(chat_id, text):
-    MAX = 3500
-    for i in range(0, len(text), MAX):
-        bot.send_message(chat_id, text[i:i+MAX])
-
-# ====== /start ======
-@bot.message_handler(commands=['start'])
+# /start и меню
+@bot.message_handler(commands=["start", "menu", "reset"])
 def cmd_start(m):
-    uid = m.from_user.id
-    user_state[uid] = {"mode": None, "data": {}, "step": 0}
     bot.send_message(
         m.chat.id,
-        "👋 Привет! Я ИИ-наставник Innertrade.\nВыбери кнопку или напиши текст.\nКоманды: /ping /reset",
-        reply_markup=main_kb()
+        "👋 Привет! Я ИИ-наставник *Innertrade*.\nВыбери кнопку или напиши текст.\nКоманды: /ping /reset",
+        reply_markup=main_menu()
+    )
+    save_state(m.from_user.id, intent="idle")
+
+@bot.message_handler(commands=["ping"])
+def cmd_ping(m):
+    bot.send_message(m.chat.id, "pong")
+
+# ---------- ХЕНДЛЕРЫ ИНТЕНТОВ ----------
+@bot.message_handler(func=lambda msg: msg.text == "🚑 У меня ошибка")
+def intent_error(m):
+    save_state(m.from_user.id, "error")
+    bot.send_message(
+        m.chat.id,
+        "Давай разберём через *MERCEDES + TOTE*.\n\n"
+        "*M* Мотивация?\n*E* Эмоции?\n*R* Результат?\n*C* Контекст?\n*E* Эффект?\n*D* Действия?\n*S* Стратегия?\n\n"
+        "*T* Test — что пошло не так?\n*O* Operate — что сделал?\n*T* Test — результат?\n*E* Evolve — что изменишь?",
+        reply_markup=main_menu()
     )
 
-@bot.message_handler(commands=['ping'])
-def cmd_ping(m):
-    bot.reply_to(m, "pong ✅")
+@bot.message_handler(func=lambda msg: msg.text == "🧩 Хочу стратегию")
+def intent_strategy(m):
+    save_state(m.from_user.id, "strategy")
+    bot.send_message(
+        m.chat.id,
+        "Ок, собираем ТС по конструктору:\n"
+        "1) Цели\n2) Стиль (дневной/свинг/позиционный)\n"
+        "3) Рынки/инструменты\n4) Правила входа/выхода\n"
+        "5) Риск (%, стоп)\n6) Сопровождение\n7) Тестирование (история/демо)",
+        reply_markup=main_menu()
+    )
 
-@bot.message_handler(commands=['reset'])
-def cmd_reset(m):
-    uid = m.from_user.id
-    user_state[uid] = {"mode": None, "data": {}, "step": 0}
-    bot.reply_to(m, "Контекст очищен.", reply_markup=main_kb())
+@bot.message_handler(func=lambda msg: msg.text == "📄 Паспорт")
+def intent_passport(m):
+    save_state(m.from_user.id, "passport")
+    bot.send_message(
+        m.chat.id,
+        "Паспорт трейдера. 1/6) На каких рынках/инструментах торгуешь?",
+        reply_markup=main_menu()
+    )
 
-# ====== Вспомогательные мастера ======
+@bot.message_handler(func=lambda msg: msg.text == "🗒 Панель недели")
+def intent_week_panel(m):
+    save_state(m.from_user.id, "week_panel")
+    bot.send_message(
+        m.chat.id,
+        "Панель недели:\n• Фокус недели\n• План (3 шага)\n• Лимиты\n• Ритуалы\n• Короткая ретро в конце недели",
+        reply_markup=main_menu()
+    )
 
-# ---- Паспорт трейдера (wizard) ----
-PASSPORT_QUESTIONS = [
-    "1/6) На каком рынке/инструментах торгуешь? (пример: акции США, EURUSD, BTC, фьючерсы…)",
-    "2/6) Твой стиль: скальпинг / интрадей / свинг / позиционный?",
-    "3/6) Таймфреймы (основные и вспомогательные)?",
-    "4/6) Риск-менеджмент: риск на сделку (%), дневные/недельные лимиты?",
-    "5/6) Правила входа/выхода в общих чертах (уровни, паттерны, новости…)?",
-    "6/6) Ритуалы и правила психогигиены (настройка, тайм-аут, завершение дня)?"
-]
+@bot.message_handler(func=lambda msg: msg.text == "🆘 Экстренно: поплыл")
+def intent_panic(m):
+    save_state(m.from_user.id, "panic")
+    bot.send_message(
+        m.chat.id,
+        "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) Сделай 10 медленных вдохов\n"
+        "4) Запиши триггер (что именно выбило)\n5) Вернись к плану сделки или закрой позицию по правилу",
+        reply_markup=main_menu()
+    )
 
-def start_passport(uid, chat_id):
-    user_state[uid] = {"mode": "passport", "step": 0, "data": {}}
-    bot.send_message(chat_id, "🪪 Паспорт трейдера. Ответь на 6 коротких вопросов.\n" + PASSPORT_QUESTIONS[0])
+@bot.message_handler(func=lambda msg: msg.text == "🤔 Не знаю, с чего начать")
+def intent_start_help(m):
+    save_state(m.from_user.id, "start_help")
+    bot.send_message(
+        m.chat.id,
+        "Предлагаю так:\n1) Заполним паспорт (1–2 мин)\n2) Выберем фокус недели\n3) Соберём скелет ТС\n"
+        "С чего начнём — паспорт или фокус недели?",
+        reply_markup=main_menu()
+    )
 
-def handle_passport(uid, chat_id, text):
-    st = user_state.get(uid, {})
-    step = st.get("step", 0)
-    data = st.get("data", {})
+# Фолбэк: если пользователь пишет текст мимо кнопок
+@bot.message_handler(content_types=["text"])
+def fallback(m):
+    # Короткий, «закрытый» ответ, без ухода в общий чат-бот
+    bot.send_message(
+        m.chat.id,
+        "Принял. Чтобы было быстрее, выбери пункт в меню ниже или напиши /menu.",
+        reply_markup=main_menu()
+    )
 
-    data[f"q{step+1}"] = text
-    step += 1
-
-    if step >= len(PASSPORT_QUESTIONS):
-        # финал
-        user_state[uid] = {"mode": None, "step": 0, "data": data}
-        summary = (
-            "✅ Паспорт сохранён (локально).\n\n"
-            f"Рынки: {data.get('q1','-')}\n"
-            f"Стиль: {data.get('q2','-')}\n"
-            f"ТФ: {data.get('q3','-')}\n"
-            f"Риски/лимиты: {data.get('q4','-')}\n"
-            f"Вход/выход: {data.get('q5','-')}\n"
-            f"Ритуалы: {data.get('q6','-')}\n\n"
-            "Дальше можно: «Хочу стратегию» или «Панель недели»."
-        )
-        send_long(chat_id, summary)
-    else:
-        user_state[uid]["step"] = step
-        user_state[uid]["data"] = data
-        bot.send_message(chat_id, PASSPORT_QUESTIONS[step])
-
-# ---- Панель недели (wizard) ----
-WEEK_PANEL_QUESTIONS = [
-    "1/4) Главный фокус недели (одна формулировка — например: «не пересиживать убытки»):",
-    "2/4) План из 3 мини-шагов на неделю (кратко, через запятую):",
-    "3/4) Лимиты риска на день/неделю (в процентах или деньгах):",
-    "4/4) Как поймёшь, что неделя удалась? (1-2 проверяемых критерия):"
-]
-
-def start_week_panel(uid, chat_id):
-    user_state[uid] = {"mode": "week_panel", "step": 0, "data": {}, "week_start": datetime.now().strftime("%Y-%m-%d")}
-    bot.send_message(chat_id, "📅 Панель недели. 4 шага — и готово.\n" + WEEK_PANEL_QUESTIONS[0])
-
-def handle_week_panel(uid, chat_id, text):
-    st = user_state.get(uid, {})
-    step = st.get("step", 0)
-    data = st.get("data", {})
-    data[f"q{step+1}"] = text
-    step += 1
-
-    if step >= len(WEEK_PANEL_QUESTIONS):
-        user_state[uid] = {"mode": None, "step": 0, "data": {}}
-        summary = (
-            "✅ Панель недели зафиксирована.\n\n"
-            f"Фокус: {data.get('q1','-')}\n"
-            f"План(3): {data.get('q2','-')}\n"
-            f"Лимиты: {data.get('q3','-')}\n"
-            f"Критерии успеха: {data.get('q4','-')}\n\n"
-            "Совет: закрепи это в заметках/планере. Можем ежедневно напоминать — скажи «Ежедневный чек-ин»."
-        )
-        send_long(chat_id, summary)
-    else:
-        user_state[uid]["step"] = step
-        user_state[uid]["data"] = data
-        bot.send_message(chat_id, WEEK_PANEL_QUESTIONS[step])
-
-# ====== Обработчик кнопок ======
-@bot.message_handler(func=lambda m: m.text in {
-    "Ошибка","Хочу стратегию","Поговорим","Паспорт","Панель недели","Мой прогресс","Материалы","Сброс"
-})
-def on_buttons(m):
-    uid = m.from_user.id
-    t = (m.text or "").strip()
-
-    if t == "Сброс":
-        user_state[uid] = {"mode": None, "step": 0, "data": {}}
-        bot.send_message(m.chat.id, "Контекст очищен.", reply_markup=main_kb())
-        return
-
-    if t == "Паспорт":
-        start_passport(uid, m.chat.id)
-        return
-
-    if t == "Панель недели":
-        start_week_panel(uid, m.chat.id)
-        return
-
-    if t == "Мой прогресс":
-        bot.send_message(
-            m.chat.id,
-            "📈 Прогресс (демо):\n— Кол-во заполненных паспортов: 1\n— Активный фокус недели: установлен\n— Следующий шаг: «Ежедневный чек-ин» или «Хочу стратегию»"
-        )
-        return
-
-    if t == "Материалы":
-        bot.send_message(
-            m.chat.id,
-            "📚 Материалы Innertrade:\n— MERCEDES / TOTE (теория)\n— Архетипы и роли\n— Конструктор ТС\n— Риск-менеджмент\nСпроси: «дай конструктор ТС» или «напомни MERCEDES»."
-        )
-        return
-
-    # Кнопки, которые идут в GPT, но с курс-контекстом
-    alias_prompt = {
-        "Ошибка": "У меня ошибка в трейдинге. Запусти мини-разбор через MERCEDES+TOTE. Дай краткий чек-лист.",
-        "Хочу стратегию": "Хочу собрать свою торговую стратегию. Веди по конструктору: цели, стиль, рынок, вход/выход, риски, сопровождение, тестирование.",
-        "Поговорим": "Поговорим о психологии трейдинга в рамках Innertrade. Помоги найти главное узкое место и предложи 1-2 шага."
-    }
-    try:
-        reply = ask_gpt_course(alias_prompt[t])
-    except Exception as e:
-        reply = f"Ошибка GPT: {e}"
-    send_long(m.chat.id, reply)
-
-# ====== Любой текст (состояния мастеров + свободный диалог) ======
-@bot.message_handler(func=lambda _: True)
-def on_text(m):
-    uid = m.from_user.id
-    text = (m.text or "").strip()
-
-    st = user_state.get(uid, {"mode": None})
-    mode = st.get("mode")
-
-    if mode == "passport":
-        handle_passport(uid, m.chat.id, text)
-        return
-
-    if mode == "week_panel":
-        handle_week_panel(uid, m.chat.id, text)
-        return
-
-    # Свободный диалог по курсу
-    try:
-        reply = ask_gpt_course(text)
-    except Exception as e:
-        reply = f"Ошибка GPT: {e}"
-    send_long(m.chat.id, reply)
-
-# ====== keepalive ======
+# ---------- KEEPALIVE для Render ----------
 app = Flask(__name__)
 
 @app.route("/")
 def root():
-    return jsonify(ok=True, service="innertrade-bot", ts=datetime.utcnow().isoformat())
+    return "OK v5"
 
 @app.route("/health")
 def health():
-    return "pong"
+    return jsonify({"status": "ok"})
+
+def start_polling():
+    # Удалим вебхук на всякий случай, чтобы polling не конфликтовал
+    try:
+        bot.remove_webhook()
+        logging.info("Webhook removed (ok)")
+    except Exception as e:
+        logging.warning(f"Webhook remove warn: {e}")
+    logging.info("Starting polling…")
+    bot.infinity_polling(timeout=30, long_polling_timeout=30, skip_pending=True)
 
 if __name__ == "__main__":
+    # Запускаем polling в отдельном потоке + Flask для Render
+    import threading
+    t = threading.Thread(target=start_polling, daemon=True)
+    t.start()
+
+    port = int(os.getenv("PORT", "10000"))
     logging.info("Starting keepalive web server…")
-    logging.info("Starting polling…")
-    bot.infinity_polling(none_stop=True, timeout=60, long_polling_timeout=60)
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    app.run(host="0.0.0.0", port=port)
