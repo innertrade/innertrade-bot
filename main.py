@@ -1,41 +1,140 @@
-# main.py — Innertrade (secure webhook edition)
-import os, logging, time
-from collections import deque, defaultdict
-from flask import Flask, request, jsonify, abort
+# main.py
+import os
+import logging
+from datetime import datetime
+from flask import Flask, request, abort, jsonify
 from telebot import TeleBot, types
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-# ---------- CONFIG ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+# ----------------- ЛОГИ -----------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+log = logging.getLogger("innertrade")
 
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")   # не используем в этом файле, но пусть будет проверка
-DATABASE_URL      = os.getenv("DATABASE_URL")
-PUBLIC_URL        = os.getenv("PUBLIC_URL")       # например: https://innertrade-bot.onrender.com
-WEBHOOK_PATH      = os.getenv("WEBHOOK_PATH", "hook")  # любая случайная строка
-TG_WEBHOOK_SECRET = os.getenv("TG_WEBHOOK_SECRET")     # сгенерируй и положи в Secrets
+# ----------------- ENV ------------------
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")  # на будущее
+DATABASE_URL       = os.getenv("DATABASE_URL")
+PUBLIC_URL         = os.getenv("PUBLIC_URL")      # напр. https://innertrade-bot.onrender.com
+WEBHOOK_PATH       = os.getenv("WEBHOOK_PATH", "tg")  # уникальный путь, напр. abcd123
+TG_WEBHOOK_SECRET  = os.getenv("TG_WEBHOOK_SECRET")   # секрет для заголовка X-Telegram-Bot-Api-Secret-Token
+MAX_BODY_BYTES     = int(os.getenv("MAX_BODY_BYTES", "1000000"))  # 1 МБ по умолчанию
 
-if not TELEGRAM_TOKEN:    raise RuntimeError("TELEGRAM_TOKEN missing")
-if not OPENAI_API_KEY:    raise RuntimeError("OPENAI_API_KEY missing")
-if not PUBLIC_URL:        raise RuntimeError("PUBLIC_URL missing (e.g., https://your-app.onrender.com)")
-if not TG_WEBHOOK_SECRET: raise RuntimeError("TG_WEBHOOK_SECRET missing")
+# Жёсткие проверки критичных переменных
+missing = [k for k, v in {
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "PUBLIC_URL": PUBLIC_URL,
+    "TG_WEBHOOK_SECRET": TG_WEBHOOK_SECRET
+}.items() if not v]
+if missing:
+    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
-# ограничения периметра
-MAX_BODY_BYTES = 1_000_000  # 1 MB
-RATE_WINDOW_S  = 60         # окно в секундах
-RATE_LIMIT     = 120        # запросов на IP в окно (с запасом под батчи Telegram)
+# ----------------- DB -------------------
+engine = None
+if DATABASE_URL:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
 
-# ---------- DB ----------
-engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+  user_id    BIGINT PRIMARY KEY,
+  mode       TEXT NOT NULL DEFAULT 'course',
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS user_state (
+  user_id    BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+  intent     TEXT,
+  step       TEXT,
+  data       JSONB,
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS errors (
+  id                BIGSERIAL PRIMARY KEY,
+  user_id           BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  error_text        TEXT NOT NULL,
+  pattern_behavior  TEXT,
+  pattern_emotion   TEXT,
+  pattern_thought   TEXT,
+  positive_goal     TEXT,
+  tote_goal         TEXT,
+  tote_ops          TEXT,
+  tote_check        TEXT,
+  tote_exit         TEXT,
+  checklist_pre     TEXT,
+  checklist_post    TEXT,
+  created_at        TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_errors_user ON errors(user_id);
+
+CREATE TABLE IF NOT EXISTS archetypes (
+  id             BIGSERIAL PRIMARY KEY,
+  user_id        BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  lead_archetype TEXT,
+  roles          JSONB,
+  subparts       JSONB,
+  conflicts      JSONB,
+  created_at     TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_archetypes_user ON archetypes(user_id);
+
+CREATE TABLE IF NOT EXISTS beliefs_values (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  beliefs     JSONB,
+  values      JSONB,
+  conflicts   JSONB,
+  reframes    JSONB,
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_beliefs_user ON beliefs_values(user_id);
+
+CREATE TABLE IF NOT EXISTS integration (
+  id            BIGSERIAL PRIMARY KEY,
+  user_id       BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  key_error_refs JSONB,
+  key_roles     JSONB,
+  key_beliefs   JSONB,
+  key_values    JSONB,
+  rules_to_ts   TEXT,
+  export_link   TEXT,
+  created_at    TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_integration_user ON integration(user_id);
+"""
+
+def init_db():
+    if not engine:
+        log.info("DATABASE_URL not set — running without DB")
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(SCHEMA_SQL))
+        log.info("DB schema ensured")
+    except SQLAlchemyError as e:
+        log.error("DB init failed: %s", e)
+
+def upsert_user(user_id: int):
+    if not engine:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO users(user_id) VALUES (:uid)
+                ON CONFLICT (user_id) DO UPDATE SET updated_at = now()
+            """), {"uid": user_id})
+    except SQLAlchemyError as e:
+        log.warning("upsert_user failed uid=%s: %s", user_id, e)
 
 def save_state(user_id: int, intent: str, step: str | None = None, data: dict | None = None):
     if not engine:
         return
     try:
         with engine.begin() as conn:
-            # если дальше включим RLS — эта строка уже готова
-            conn.execute(text("SET app.user_id = :uid"), {"uid": str(user_id)})
             conn.execute(text("""
                 INSERT INTO user_state(user_id, intent, step, data, updated_at)
                 VALUES (:uid, :intent, :step, COALESCE(:data, '{}'::jsonb), now())
@@ -46,10 +145,9 @@ def save_state(user_id: int, intent: str, step: str | None = None, data: dict | 
                     updated_at = now()
             """), {"uid": user_id, "intent": intent, "step": step, "data": data})
     except SQLAlchemyError as e:
-        # не логируем данные, только мета
-        logging.error(f"DB save_state failed for {user_id}: {e.__class__.__name__}")
+        log.warning("save_state failed uid=%s intent=%s: %s", user_id, intent, e)
 
-# ---------- TELEGRAM BOT ----------
+# ----------------- TELEGRAM -------------------
 bot = TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
 
 def main_menu():
@@ -59,20 +157,21 @@ def main_menu():
     kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
     return kb
 
-@bot.message_handler(commands=["start","menu","reset"])
+@bot.message_handler(commands=["start", "menu", "reset"])
 def cmd_start(m):
+    upsert_user(m.from_user.id)
+    save_state(m.from_user.id, "idle")
     bot.send_message(
         m.chat.id,
         "👋 Привет! Я ИИ-наставник *Innertrade*.\nВыбери кнопку или напиши текст.\nКоманды: /ping /reset",
         reply_markup=main_menu()
     )
-    save_state(m.from_user.id, "idle")
 
 @bot.message_handler(commands=["ping"])
 def cmd_ping(m):
     bot.send_message(m.chat.id, "pong")
 
-# --- интенты
+# --------- Интенты (кнопки) ----------
 @bot.message_handler(func=lambda msg: msg.text == "🚑 У меня ошибка")
 def intent_error(m):
     save_state(m.from_user.id, "error")
@@ -119,7 +218,7 @@ def intent_panic(m):
     save_state(m.from_user.id, "panic")
     bot.send_message(
         m.chat.id,
-        "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) Сделай 10 медленных вдохов\n"
+        "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) 10 медленных вдохов\n"
         "4) Запиши триггер (что именно выбило)\n5) Вернись к плану сделки или закрой позицию по правилу",
         reply_markup=main_menu()
     )
@@ -142,68 +241,59 @@ def fallback(m):
         reply_markup=main_menu()
     )
 
-# ---------- FLASK APP (WEBHOOK ONLY) ----------
+# ----------------- FLASK -----------------
 app = Flask(__name__)
-
-# простейший rate-limit по IP
-_hits: dict[str, deque] = defaultdict(deque)
-def _client_ip():
-    # Render/прокси могут ставить X-Forwarded-For
-    xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.remote_addr or "?"
-
-@app.before_request
-def guard():
-    if request.path.startswith(f"/webhook/{WEBHOOK_PATH}"):
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_WEBHOOK_SECRET:
-            abort(401)
-        if request.content_length and request.content_length > MAX_BODY_BYTES:
-            abort(413)
-        # rate limit
-        now = time.time()
-        dq = _hits[_client_ip()]
-        while dq and now - dq[0] > RATE_WINDOW_S:
-            dq.popleft()
-        if len(dq) >= RATE_LIMIT:
-            abort(429)
-        dq.append(now)
 
 @app.get("/")
 def root():
-    return "OK (webhook)", 200
+    return "OK", 200
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({
+        "status": "ok",
+        "time": datetime.utcnow().isoformat() + "Z",
+        "webhook": f"{PUBLIC_URL}/webhook/{WEBHOOK_PATH}"
+    })
 
 @app.post(f"/webhook/{WEBHOOK_PATH}")
 def webhook():
+    # Безопасность периметра
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_WEBHOOK_SECRET:
+        abort(401)
+    if request.content_length and request.content_length > MAX_BODY_BYTES:
+        abort(413)
+
     try:
-        upd = request.get_json(force=True, silent=False)
-    except Exception:
-        abort(400)
-    try:
-        update = types.Update.de_json(upd)
+        # TeleBot понимает Update из JSON-строки
+        update_json = request.get_data(as_text=True)
+        update = types.Update.de_json(update_json)
         bot.process_new_updates([update])
     except Exception as e:
-        logging.error(f"update fail: {e.__class__.__name__}")
-        # 200 чтобы Telegram не ретрайл миллион раз
-        return jsonify({"ok": False}), 200
-    return jsonify({"ok": True}), 200
+        log.exception("Update handling failed: %s", e)
+        return "ERR", 500
+    return "OK", 200
 
-def setup_webhook():
-    # Сброс и установка вебхука с секретом (drop_pending_updates=True на всякий)
-    try:
-        bot.remove_webhook()
-    except Exception:
-        pass
+def ensure_webhook():
     url = f"{PUBLIC_URL}/webhook/{WEBHOOK_PATH}"
-    ok = bot.set_webhook(url=url, secret_token=TG_WEBHOOK_SECRET, drop_pending_updates=True)
-    logging.info(f"Webhook set to {url}: {ok}")
+    try:
+        ok = bot.set_webhook(
+            url=url,
+            secret_token=TG_WEBHOOK_SECRET,
+            drop_pending_updates=False,
+            max_connections=40
+        )
+        if ok:
+            log.info("Webhook set to %s", url)
+        else:
+            log.warning("bot.set_webhook returned False")
+    except Exception as e:
+        log.error("set_webhook failed: %s", e)
 
+# ----------------- ENTRY -----------------
 if __name__ == "__main__":
-    setup_webhook()
+    init_db()
+    ensure_webhook()
     port = int(os.getenv("PORT", "10000"))
+    log.info("Starting Flask on 0.0.0.0:%s", port)
     app.run(host="0.0.0.0", port=port)
