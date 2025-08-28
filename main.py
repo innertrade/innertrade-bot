@@ -3,236 +3,194 @@ import os
 import json
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Any
 
 from flask import Flask, request, jsonify, abort
 from telebot import TeleBot, types
-from telebot.types import Update
-
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
-
+from sqlalchemy.exc import OperationalError
 from openai import OpenAI
 
-# =========================
-# ЛОГИ
-# =========================
+# ----------------- ЛОГИ -----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s"
 )
 log = logging.getLogger("innertrade")
 
-# =========================
-# ENV
-# =========================
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
-DATABASE_URL      = os.getenv("DATABASE_URL")
-PUBLIC_URL        = os.getenv("PUBLIC_URL")
-WEBHOOK_PATH      = os.getenv("WEBHOOK_PATH")           # напр. wbhk_9t3x
-TG_WEBHOOK_SECRET = os.getenv("TG_WEBHOOK_SECRET")      # любой секрет для X-Telegram-Bot-Api-Secret-Token
+# ----------------- ENV -----------------
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
+DATABASE_URL       = os.getenv("DATABASE_URL")
+PUBLIC_URL         = os.getenv("PUBLIC_URL")
+WEBHOOK_PATH       = os.getenv("WEBHOOK_PATH")           # например: wbhk_9t3x
+TG_WEBHOOK_SECRET  = os.getenv("TG_WEBHOOK_SECRET")      # произвольный секрет
 
-for k, v in {
+for key, val in {
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
     "OPENAI_API_KEY": OPENAI_API_KEY,
-    "DATABASE_URL": DATABASE_URL,
     "PUBLIC_URL": PUBLIC_URL,
     "WEBHOOK_PATH": WEBHOOK_PATH,
-    "TG_WEBHOOK_SECRET": TG_WEBHOOK_SECRET,
+    "TG_WEBHOOK_SECRET": TG_WEBHOOK_SECRET
 }.items():
-    if not v:
-        raise RuntimeError(f"Missing ENV: {k}")
+    if not val:
+        raise RuntimeError(f"{key} missing")
 
-# =========================
-# КЛИЕНТЫ
-# =========================
-bot = TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
-ai  = OpenAI(api_key=OPENAI_API_KEY)
+# ----------------- OPENAI -----------------
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =========================
-# DB
-# =========================
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-
-def db_ok() -> bool:
+def gpt_reply(system_prompt: str, user_prompt: str) -> str:
+    """Короткий, тёплый ответ, 1 уточняющий вопрос, без «лекций»."""
     try:
-        with engine.connect() as c:
-            c.execute(text("SELECT 1"))
-        return True
+        rsp = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt
+                }
+            ],
+            max_output_tokens=220,
+            temperature=0.3
+        )
+        return (rsp.output_text or "").strip()
     except Exception as e:
-        log.error(f"DB check error: {e}")
-        return False
+        log.warning(f"OpenAI error: {e}")
+        return "Слышал тебя. Можем обсудить это подробнее или пойти по шагам."
 
-def ensure_user(uid: int):
+# ----------------- DB -----------------
+engine = None
+if DATABASE_URL:
     try:
-        with engine.begin() as c:
-            c.execute(text("""
-                INSERT INTO users(user_id) VALUES (:uid)
-                ON CONFLICT (user_id) DO NOTHING
-            """), {"uid": uid})
-    except SQLAlchemyError as e:
-        log.error(f"ensure_user: {e}")
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
+        with engine.begin() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS user_state (
+                user_id      BIGINT PRIMARY KEY,
+                intent       TEXT,
+                step         TEXT,
+                data         JSONB,
+                updated_at   TIMESTAMPTZ DEFAULT now()
+            );
+            """))
+        log.info("DB connected & user_state ready")
+    except OperationalError as e:
+        log.warning(f"DB not available: {e}")
+        engine = None
+else:
+    log.info("DATABASE_URL not set — running without DB")
 
-def set_state(uid: int, intent: Optional[str]=None, step: Optional[str]=None, data: Optional[dict]=None):
-    try:
-        with engine.begin() as c:
-            c.execute(text("""
-                INSERT INTO user_state(user_id, intent, step, data, updated_at)
-                VALUES (:uid, :intent, :step, COALESCE(:data,'{}'::jsonb), NOW())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    intent = COALESCE(:intent, user_state.intent),
-                    step   = COALESCE(:step, user_state.step),
-                    data   = COALESCE(:data, user_state.data),
-                    updated_at = NOW()
-            """), {"uid": uid, "intent": intent, "step": step, "data": json.dumps(data) if isinstance(data, dict) else data})
-    except SQLAlchemyError as e:
-        log.error(f"set_state: {e}")
+def get_state(uid: int) -> dict:
+    st = {"intent": "greet", "step": None, "data": {}}
+    if not engine:
+        return st
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT intent, step, data FROM user_state WHERE user_id=:uid"),
+                           {"uid": uid}).mappings().first()
+        if not row:
+            conn.execute(text(
+                "INSERT INTO user_state(user_id, intent, step, data) VALUES (:uid, :i, :s, '{}'::jsonb)"),
+                {"uid": uid, "i": st["intent"], "s": st["step"]})
+            return st
+        st["intent"] = row["intent"]
+        st["step"]   = row["step"]
+        st["data"]   = row["data"] or {}
+        return st
 
-def get_state(uid: int) -> Dict[str, Any]:
-    try:
-        with engine.begin() as c:
-            r = c.execute(text("SELECT intent, step, data FROM user_state WHERE user_id=:uid"), {"uid": uid}).mappings().first()
-            if r:
-                return {"intent": r["intent"], "step": r["step"], "data": r["data"] or {}}
-            return {"intent": "greet", "step": None, "data": {}}
-    except SQLAlchemyError as e:
-        log.error(f"get_state: {e}")
-        return {"intent": "greet", "step": None, "data": {}}
+def save_state(uid: int, intent: str | None = None, step: str | None = None, data_patch: dict | None = None):
+    if not engine:
+        return
+    st = get_state(uid)
+    if intent is not None:
+        st["intent"] = intent
+    if step is not None or step is None:
+        st["step"] = step
+    if data_patch:
+        # лёгкая мердж-логика
+        base = st.get("data") or {}
+        base.update(data_patch)
+        st["data"] = base
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO user_state (user_id, intent, step, data, updated_at)
+        VALUES (:uid, :intent, :step, COALESCE(:data,'{}'::jsonb), now())
+        ON CONFLICT (user_id) DO UPDATE
+        SET intent=EXCLUDED.intent,
+            step=EXCLUDED.step,
+            data=EXCLUDED.data,
+            updated_at=now()
+        """), {"uid": uid, "intent": st["intent"], "step": st["step"], "data": json.dumps(st["data"])})
 
-def save_error_block(uid: int, fields: Dict[str, Optional[str]]):
-    # fields: error_text, pattern_behavior, pattern_emotion, pattern_thought,
-    #         positive_goal, tote_goal, tote_ops, tote_check, tote_exit, checklist_pre, checklist_post
-    try:
-        with engine.begin() as c:
-            cols = ["user_id"] + list(fields.keys())
-            vals = {**fields, "user_id": uid}
-            sql_cols = ", ".join(cols)
-            sql_params = ", ".join([f":{k}" for k in cols])
-            c.execute(text(f"INSERT INTO errors ({sql_cols}) VALUES ({sql_params})"), vals)
-    except SQLAlchemyError as e:
-        log.error(f"save_error_block: {e}")
+# ----------------- TELEGRAM -----------------
+bot = TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
 
-# =========================
-# ВСПОМОГАТЬ
-# =========================
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🚑 У меня ошибка", "🧩 Собрать ТС")
+    kb.row("🚑 У меня ошибка", "🧩 Хочу стратегию")
     kb.row("📄 Паспорт", "🗒 Панель недели")
     kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
     return kb
 
-def paraphrase_error(text_ru: str) -> str:
-    # Небольшая переформулировка с GPT — без «допроса» и без термина «поведение/навык»
-    try:
-        msg = [
-            {"role":"system","content":"Коротко перефразируй трейдерскую проблему простыми словами (1 предложение). Без оценок и советов."},
-            {"role":"user","content": text_ru}
-        ]
-        rsp = ai.chat.completions.create(model="gpt-4o-mini", messages=msg, temperature=0.2, max_tokens=60)
-        return rsp.choices[0].message.content.strip()
-    except Exception as e:
-        log.warning(f"paraphrase_error fallback: {e}")
-        return text_ru.strip()
+def address_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.row("ты", "вы")
+    return kb
 
-def gentle_probe(previous: str) -> str:
-    # 2–3 мягких уточнения перед MERCEDES
-    try:
-        msg = [
-            {"role":"system","content":"Ты доброжелательный коуч по трейдингу. Задай один короткий уточняющий вопрос по проблеме, чтобы сделать её конкретнее (уровень действия), без оценок и терминов. 1 вопрос."},
-            {"role":"user","content": previous}
-        ]
-        rsp = ai.chat.completions.create(model="gpt-4o-mini", messages=msg, temperature=0.2, max_tokens=80)
-        return rsp.choices[0].message.content.strip()
-    except Exception as e:
-        log.warning(f"gentle_probe fallback: {e}")
-        return "Правильно ли я понял суть? Где именно это чаще всего случается — в момент входа, сопровождения или выхода?"
+BOT_NAME = "Kai"
 
-def short_coach_reply(user_text: str, context: Dict[str,Any]) -> str:
-    # Свободный разговор «на первой линии» — мягко, по делу, но без ухода в длинные лекции
-    try:
-        sys = (
-            "Ты эмпатичный наставник Innertrade. Общайся коротко и по делу, простым языком. "
-            "Если человек делится болью — отзеркаль, уточни 1 деталь и предложи мягкий следующий шаг. "
-            "Не дави «структурой», не упоминай внутренние термины (MERCEDES/TOTE). "
-            "Не давай финансовых советов. Не проси личные данные. 1–2 предложения."
-        )
-        msgs = [{"role":"system","content":sys},{"role":"user","content":user_text}]
-        rsp = ai.chat.completions.create(model="gpt-4o-mini", messages=msgs, temperature=0.4, max_tokens=90)
-        return rsp.choices[0].message.content.strip()
-    except Exception as e:
-        log.warning(f"short_coach_reply fallback: {e}")
-        return "Понимаю. Расскажи, на каком этапе сделки это чаще всего всплывает — вход, сопровождение или выход?"
+def coach_system_prompt(address: str) -> str:
+    # адрес: "ты" | "вы"
+    polite = "на ты" if address == "ты" else "на вы"
+    return (
+        f"Ты тёплый, спокойный коуч по трейдингу, общаешься {polite}. "
+        "Цель — мягко выслушать, задать 1 уточняющий вопрос и при необходимости вернуть к шагам. "
+        "Не читай лекции. Коротко, по делу, максимум 2–3 предложения. "
+        "Если собеседник спросил «как тебя зовут», ответь: «Я Kai». "
+        "Если человек просит помощи с ошибкой — уточни пример и триггер, "
+        "но не дави и не спеши к структуре. Никаких названий методик, пока не спросят."
+    )
 
-def want_move_to_mercedes(track: Dict[str,Any]) -> bool:
-    # Как только есть короткая формулировка + 1–2 уточнения — можно переходить
-    probes = track.get("probes_count", 0)
-    err    = (track.get("error_text") or "").strip()
-    return len(err) > 0 and probes >= 2
+# ----------------- ДИАЛОГОВАЯ ЛОГИКА -----------------
 
-# =========================
-# FLASK (ВЕБХУК + HEALTH/STATUS)
-# =========================
-app = Flask(__name__)
+def ensure_address(uid: int, chat_id: int) -> str:
+    st = get_state(uid)
+    data = st.get("data", {})
+    address = data.get("address", None)
+    if not address:
+        # предложим, но не блокируем диалог
+        bot.send_message(chat_id, "Как удобнее общаться — *ты* или *вы*? (можешь выбрать ниже)", reply_markup=address_kb())
+        save_state(uid, data_patch={"address": "ты"})  # дефолт — «ты»
+        address = "ты"
+    return address
 
-@app.get("/health")
-def health():
-    return jsonify({"status":"ok","time": datetime.utcnow().isoformat()})
+def increment_counter(uid: int, key: str) -> int:
+    st = get_state(uid)
+    data = st.get("data", {})
+    val = int(data.get(key, 0)) + 1
+    save_state(uid, data_patch={key: val})
+    return val
 
-@app.get("/status")
-def status():
-    ok = db_ok()
-    # пробуем вытащить одного (для простоты, без auth)
-    sample = None
-    try:
-        with engine.connect() as c:
-            r = c.execute(text("SELECT user_id,intent,step FROM user_state ORDER BY updated_at DESC LIMIT 1")).mappings().first()
-            if r:
-                sample = dict(r)
-    except Exception:
-        sample = None
-    return jsonify({
-        "ok": True,
-        "time": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-        "intent": sample["intent"] if sample else None,
-        "step": sample["step"] if sample else None,
-        "db": "ok" if ok else "fail"
-    })
+def summarize_problem_text(txt: str) -> str:
+    # короткое «обобщение» без дословного копипаста
+    return f"Суммарно вижу: *есть трудность со следованием своим правилам* — вмешиваешься в сделку/сдвигаешь стоп/фиксируешь рано."
 
-MAX_BODY = 1_000_000
-
-@app.post(f"/{WEBHOOK_PATH}")
-def webhook():
-    # Секрет-хедер Telegram: X-Telegram-Bot-Api-Secret-Token
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_WEBHOOK_SECRET:
-        abort(401)
-    cl = request.content_length or 0
-    if cl > MAX_BODY:
-        abort(413)
-    try:
-        update = Update.de_json(request.get_json(force=True))
-        bot.process_new_updates([update])
-        return "OK", 200
-    except Exception as e:
-        log.error(f"webhook error: {e}")
-        return "ERR", 500
-
-# =========================
-# ХЕНДЛЕРЫ
-# =========================
+# ----------------- ХЕНДЛЕРЫ -----------------
 
 @bot.message_handler(commands=["start","menu","reset"])
 def cmd_start(m):
     uid = m.from_user.id
-    ensure_user(uid)
-    set_state(uid, intent="greet", step=None, data={"probes_count":0,"error_text":""})
-    name = (m.from_user.first_name or "").strip() or "друг"
+    save_state(uid, intent="greet", step=None, data_patch={"clarify_count": 0})
     bot.send_message(
         m.chat.id,
-        f"👋 Привет, {name}! Можем просто поговорить — что болит в торговле — или выбрать пункт ниже.",
+        "👋 Привет! Я наставник *Innertrade*. "
+        "Можем спокойно поговорить — просто напиши, что болит в торговле. "
+        "Или выбери пункт ниже.",
         reply_markup=main_menu()
     )
+    ensure_address(uid, m.chat.id)
 
 @bot.message_handler(commands=["ping"])
 def cmd_ping(m):
@@ -242,279 +200,236 @@ def cmd_ping(m):
 def cmd_status(m):
     uid = m.from_user.id
     st = get_state(uid)
-    ok = db_ok()
-    bot.send_message(
-        m.chat.id,
-        "```\n" + json.dumps({
-            "ok": True,
-            "time": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
-            "intent": st.get("intent"),
-            "step": st.get("step"),
-            "db": "ok" if ok else "fail",
-        }, ensure_ascii=False, indent=2) + "\n```",
-        parse_mode="Markdown"
-    )
+    db = "ok" if engine else "no-db"
+    payload = {
+        "ok": True,
+        "time": datetime.utcnow().isoformat(timespec="seconds"),
+        "intent": st.get("intent"),
+        "step": st.get("step"),
+        "db": db
+    }
+    bot.send_message(m.chat.id, f"```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```", parse_mode="Markdown")
 
-# ----- Кнопки меню -----
+# --- КНОПКИ МЕНЮ ---
 
 @bot.message_handler(func=lambda msg: msg.text == "🚑 У меня ошибка")
-def btn_error(m):
+def intent_error(m):
     uid = m.from_user.id
-    ensure_user(uid)
-    set_state(uid, intent="error", step="ask_error", data={"probes_count":0,"error_text":""})
+    save_state(uid, intent="error", step="ask_problem", data_patch={"clarify_count": 0})
     bot.send_message(
         m.chat.id,
-        "Расскажи коротко, что именно идёт не так. Не переживай о формулировках — просто как есть.",
+        "Окей. Расскажи коротко про основную ошибку (1–2 предложения, как это происходит на практике).",
         reply_markup=main_menu()
     )
 
-@bot.message_handler(func=lambda msg: msg.text == "🧩 Собрать ТС")
-def btn_ts(m):
+@bot.message_handler(func=lambda msg: msg.text == "🧩 Хочу стратегию")
+def intent_strategy(m):
     uid = m.from_user.id
-    ensure_user(uid)
-    set_state(uid, intent="ts", step="intro")
+    save_state(uid, intent="strategy", step=None)
     bot.send_message(
         m.chat.id,
-        "Начнём со стиля и входа. Как обычно ты заходишь в сделку и на каких ТФ? (позже дополним стоп/сопровождение/лимиты)",
-        reply_markup=main_menu()
+        "Соберём ТС в два шага: 1) подход/ТФ/вход; 2) стоп/сопровождение/выход/риск. "
+        "Готов? Напиши, каким рынком и таймфреймом занимаешься сейчас."
     )
 
 @bot.message_handler(func=lambda msg: msg.text == "📄 Паспорт")
-def btn_passport(m):
+def intent_passport(m):
     uid = m.from_user.id
-    ensure_user(uid)
-    set_state(uid, intent="passport", step="intro")
-    bot.send_message(
-        m.chat.id,
-        "Паспорт трейдера. Давай начнём с рынков/инструментов и таймфреймов, на которых планируешь работать.",
-        reply_markup=main_menu()
-    )
+    save_state(uid, intent="passport", step=None)
+    bot.send_message(m.chat.id, "Паспорт трейдера — начнём с рынка/инструментов. Чем торгуешь сейчас?")
 
 @bot.message_handler(func=lambda msg: msg.text == "🗒 Панель недели")
-def btn_week(m):
+def intent_week_panel(m):
     uid = m.from_user.id
-    ensure_user(uid)
-    set_state(uid, intent="week_panel", step="focus")
-    bot.send_message(
-        m.chat.id,
-        "Панель недели: какой один фокус возьмём на ближайшие 7 дней?",
-        reply_markup=main_menu()
-    )
+    save_state(uid, intent="week_panel", step=None)
+    bot.send_message(m.chat.id, "Панель недели: какой фокус возьмём на ближайшие 7 дней? (1 узел)")
 
 @bot.message_handler(func=lambda msg: msg.text == "🆘 Экстренно: поплыл")
-def btn_panic(m):
+def intent_panic(m):
     uid = m.from_user.id
-    ensure_user(uid)
-    set_state(uid, intent="panic", step="ritual")
+    save_state(uid, intent="panic", step=None)
     bot.send_message(
         m.chat.id,
-        "Стоп-протокол:\n1) Пауза 2 минуты\n2) Закрой график на 5 минут\n3) 10 медленных вдохов\n4) Запиши триггер\n5) Вернись к плану сделки или закрой по правилу",
-        reply_markup=main_menu()
+        "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой терминал/вкладку с графиком\n3) 10 медленных вдохов\n"
+        "4) Запиши триггер (что именно выбило)\n5) Вернись к плану сделки или закрой позицию по правилу"
     )
 
 @bot.message_handler(func=lambda msg: msg.text == "🤔 Не знаю, с чего начать")
-def btn_start_help(m):
+def intent_start_help(m):
     uid = m.from_user.id
-    ensure_user(uid)
-    set_state(uid, intent="start_help", step="choose")
+    save_state(uid, intent="start_help", step=None)
     bot.send_message(
         m.chat.id,
-        "Предлагаю так: 1) быстро зафиксируем текущую боль, 2) определим фокус недели, 3) соберём каркас ТС. С чего начнём?",
-        reply_markup=main_menu()
+        "Предлагаю так: 1) Заполним паспорт (1–2 мин) 2) Выберем фокус недели 3) Соберём скелет ТС.\n"
+        "С чего начнём?"
     )
 
-# ----- Ядро сценария «Ошибка» -----
-
-def handle_error_flow(m, st):
+# --- УТОЧНЕНИЕ «ты/вы» ---
+@bot.message_handler(func=lambda msg: msg.text in ["ты","вы"])
+def set_address(m):
     uid = m.from_user.id
-    data = st.get("data") or {}
+    save_state(uid, data_patch={"address": m.text.lower()})
+    bot.send_message(m.chat.id, "Принято. Можем просто поговорить — расскажи, что сейчас болит, или выбери пункт ниже.", reply_markup=main_menu())
+
+# --- СВОБОДНЫЙ ТЕКСТ И СЦЕНАРИИ ---
+
+def handle_error_flow(uid: int, chat_id: int, text_in: str):
+    st = get_state(uid)
+    data = st.get("data", {})
     step = st.get("step")
 
-    txt = (m.text or "").strip()
-
-    # Шаг 1: запросить проблему (и 2–3 мягких уточнения до MERCEDES)
-    if step in (None, "ask_error"):
-        if not data.get("error_text"):
-            # первая формулировка
-            data["error_text"] = txt
-            data["probes_count"] = 0
-            set_state(uid, intent="error", step="probe", data=data)
-            probe = gentle_probe(txt)
-            bot.send_message(m.chat.id, probe)
+    if step == "ask_problem":
+        # 2 шага мягкой конкретизации перед структурой
+        cc = increment_counter(uid, "clarify_count")
+        address = data.get("address", "ты")
+        if cc <= 2:
+            # мягкое уточнение через GPT
+            sys = coach_system_prompt(address)
+            u = f"Человек описывает ошибку так:\n{text_in}\nПопроси уточнить конкретику примера и триггера. Одно короткое уточнение."
+            reply = gpt_reply(sys, u)
+            # параллельно приготовим нашу «свертку»
+            save_state(uid, data_patch={"last_problem_raw": text_in})
+            bot.send_message(chat_id, reply)
             return
         else:
-            # уже была, уточняем дальше
-            data["probes_count"] = int(data.get("probes_count", 0)) + 1
-            # аккумулируем контекст
-            data["error_text"] = (data["error_text"] + " | " + txt).strip()
-            if want_move_to_mercedes(data):
-                # перефраз — НЕ дословно
-                p = paraphrase_error(data["error_text"])
-                data["error_paraphrase"] = p
-                set_state(uid, intent="error", step="confirm", data=data)
-                bot.send_message(
-                    m.chat.id,
-                    f"Суммирую так: *{p}*\nПодходит? Если хочется — добавь/исправь одним предложением."
-                )
-                return
-            else:
-                set_state(uid, intent="error", step="probe", data=data)
-                probe = gentle_probe(data["error_text"])
-                bot.send_message(m.chat.id, probe)
-                return
+            summary = summarize_problem_text(text_in)
+            save_state(uid, step="confirm_problem", data_patch={"problem_summary": summary})
+            bot.send_message(chat_id, f"{summary}\n\nТак подходит? Если да — напиши *да*. Если нет — напиши, что добавить/исправить.")
+            return
 
-    if step == "probe":
-        data["probes_count"] = int(data.get("probes_count", 0)) + 1
-        data["error_text"] = (data.get("error_text","") + " | " + txt).strip()
-        if want_move_to_mercedes(data):
-            p = paraphrase_error(data["error_text"])
-            data["error_paraphrase"] = p
-            set_state(uid, intent="error", step="confirm", data=data)
-            bot.send_message(
-                m.chat.id,
-                f"Суммирую так: *{p}*\nПодходит? Если хочется — добавь/исправь одним предложением."
-            )
+    if step == "confirm_problem":
+        yes = text_in.strip().lower()
+        if yes in ("да","ага","ок","верно","подходит"):
+            save_state(uid, step="mer_context")
+            bot.send_message(chat_id, "КОНТЕКСТ. В какой ситуации это обычно происходит? Что предшествует? (1–2 предложения)")
             return
         else:
-            set_state(uid, intent="error", step="probe", data=data)
-            probe = gentle_probe(data["error_text"])
-            bot.send_message(m.chat.id, probe)
+            # ещё одна попытка уточнить
+            save_state(uid, step="ask_problem", data_patch={"clarify_count": 0})
+            bot.send_message(chat_id, "Окей, давай уточним ещё раз: опиши, пожалуйста, как именно это проявляется в сделке (коротко).")
             return
 
-    # Подтверждение
-    if step == "confirm":
-        # любое короткое «да/ок/норм» — двигаемся дальше; иначе — принимаем уточнение и ещё раз подтверждаем
-        ack = txt.lower()
-        if any(w in ack for w in ["да","ок","ага","подходит","норм","верно","согласен","согласна","супер"]):
-            set_state(uid, intent="error", step="mer_context", data=data)
-            bot.send_message(m.chat.id, "Окей. КОНТЕКСТ — когда это обычно всплывает? Что предшествует?")
-            return
-        else:
-            # приняли правку, ещё раз перефразируем коротко
-            merged = (data.get("error_paraphrase","") + " | " + txt).strip()
-            p2 = paraphrase_error(merged)
-            data["error_paraphrase"] = p2
-            set_state(uid, intent="error", step="confirm", data=data)
-            bot.send_message(m.chat.id, f"Исправил формулировку: *{p2}*\nПодходит?")
-            return
-
-    # MERCEDES (короткая версия: контекст → эмоции → мысли → поведение)
+    # MERCEDES чётко по шагам
     if step == "mer_context":
-        data["mer_context"] = txt
-        set_state(uid, intent="error", step="mer_emotions", data=data)
-        bot.send_message(m.chat.id, "ЭМОЦИИ — что чувствуешь в такие моменты? (несколько слов)")
+        save_state(uid, step="mer_emotions", data_patch={"mer_context": text_in})
+        bot.send_message(chat_id, "ЭМОЦИИ. Что чувствуешь в момент ошибки? (несколько слов)")
         return
 
     if step == "mer_emotions":
-        data["mer_emotions"] = txt
-        set_state(uid, intent="error", step="mer_thoughts", data=data)
-        bot.send_message(m.chat.id, "МЫСЛИ — что говоришь себе? (1–2 короткие фразы)")
+        save_state(uid, step="mer_thoughts", data_patch={"mer_emotions": text_in})
+        bot.send_message(chat_id, "МЫСЛИ. Что говоришь себе в этот момент? (1–2 фразы)")
         return
 
     if step == "mer_thoughts":
-        data["mer_thoughts"] = txt
-        set_state(uid, intent="error", step="mer_behavior", data=data)
-        bot.send_message(m.chat.id, "ПОВЕДЕНИЕ — что делаешь конкретно? Опиши действие глаголами.")
+        save_state(uid, step="mer_behavior", data_patch={"mer_thoughts": text_in})
+        bot.send_message(chat_id, "ПОВЕДЕНИЕ. Что именно делаешь? Опиши действие глаголами (1–2 предложения).")
         return
 
     if step == "mer_behavior":
-        data["mer_behavior"] = txt
-        # Резюме
-        summary = (
-            f"Резюме паттерна:\n"
-            f"• Контекст: {data.get('mer_context','—')}\n"
-            f"• Эмоции: {data.get('mer_emotions','—')}\n"
-            f"• Мысли: {data.get('mer_thoughts','—')}\n"
-            f"• Поведение: {data.get('mer_behavior','—')}"
-        )
-        set_state(uid, intent="error", step="goal", data=data)
-        bot.send_message(m.chat.id, summary)
-        bot.send_message(m.chat.id, "Сформулируем *новую цель* одним предложением: что хочешь делать вместо прежнего поведения?")
+        save_state(uid, step="new_goal", data_patch={"mer_behavior": text_in})
+        bot.send_message(chat_id, "Сформулируй новую цель одним предложением — что хочешь делать вместо прежнего поведения?")
         return
 
-    # Цель и короткий TOTE
-    if step == "goal":
-        data["positive_goal"] = txt
-        set_state(uid, intent="error", step="tote_ops", data=data)
-        bot.send_message(m.chat.id, "Хорошо. Какие 2–3 *шага* помогут держаться этой цели в ближайших 3 сделках?")
+    if step == "new_goal":
+        # переходим к TOTE, но без названий методик
+        save_state(uid, step="tote_ops", data_patch={"new_goal": text_in})
+        bot.send_message(chat_id, "Ок. Какие 2–3 шага помогут держаться этой цели в ближайших 3 сделках?")
         return
 
     if step == "tote_ops":
-        data["tote_ops"] = txt
-        set_state(uid, intent="error", step="tote_check", data=data)
-        bot.send_message(m.chat.id, "Критерий проверки: по каким признакам поймёшь, что получилось? (кратко)")
+        save_state(uid, step=None, intent="idle", data_patch={"tote_ops": text_in})
+        bot.send_message(chat_id, "Принято. Сохранили. Готов продолжать — скажи слово, или выбери пункт меню.", reply_markup=main_menu())
         return
 
-    if step == "tote_check":
-        data["tote_check"] = txt
-        # Сохраняем блок в errors
-        save_error_block(uid, {
-            "error_text": data.get("error_paraphrase") or data.get("error_text"),
-            "pattern_behavior": data.get("mer_behavior"),
-            "pattern_emotion": data.get("mer_emotions"),
-            "pattern_thought": data.get("mer_thoughts"),
-            "positive_goal": data.get("positive_goal"),
-            "tote_goal": data.get("positive_goal"),  # в краткой версии цель = TOTE.goal
-            "tote_ops": data.get("tote_ops"),
-            "tote_check": data.get("tote_check"),
-            "tote_exit": None,
-            "checklist_pre": None,
-            "checklist_post": None
-        })
-        set_state(uid, intent="idle", step=None, data={})
-        bot.send_message(
-            m.chat.id,
-            "Готово. Зафиксировал цель и шаги. Хочешь добавить это в *фокус недели* или двинемся дальше?",
-            reply_markup=main_menu()
-        )
-        return
-
-    # На всякий — мягкий ответ
-    bot.send_message(m.chat.id, "Принял. Продолжим. Коротко опиши, что именно идёт не так — и двинемся шаг за шагом.")
-
-# ----- Свободный текст / роутинг -----
+    # если почему-то шаг не распознан, откатимся в мягкий диалог
+    save_state(uid, intent="greet", step=None)
+    bot.send_message(chat_id, "Окей. Можем продолжить разговор свободно или выбрать пункт в меню.", reply_markup=main_menu())
 
 @bot.message_handler(content_types=["text"])
 def on_text(m):
     uid = m.from_user.id
-    ensure_user(uid)
+    txt = (m.text or "").strip()
     st = get_state(uid)
-    intent = st.get("intent") or "greet"
+    intent = st.get("intent", "greet")
+    step   = st.get("step")
+    data   = st.get("data", {}) or {}
+    address = ensure_address(uid, m.chat.id)
 
-    t = (m.text or "").strip()
-
-    # Явные интенты
-    if intent == "error" or t.lower().startswith(("ошибка","просадк","нарушаю","не по сетапу")):
-        # Если человек сам зашёл текстом — инициализируем сценарий
-        if intent != "error":
-            set_state(uid, intent="error", step="ask_error", data={"probes_count":0,"error_text":""})
-        handle_error_flow(m, get_state(uid))
+    low = txt.lower()
+    # Простой FAQ: «как тебя зовут»
+    if "как тебя зовут" in low or "тебя зовут" in low:
+        bot.send_message(m.chat.id, f"Я {BOT_NAME} 🙂")
         return
 
-    # В свободном режиме — короткий коуч-ответ с GPT
-    reply = short_coach_reply(t, st)
-    bot.send_message(m.chat.id, reply, reply_markup=main_menu())
+    # Если в режиме «ошибка» — ведём сценарий
+    if intent == "error":
+        handle_error_flow(uid, m.chat.id, txt)
+        return
 
-# =========================
-# СТАРТ СЕРВЕРА + ВЕБХУК
-# =========================
+    # Иначе — мягкий «коуч-режим» через OpenAI
+    sys = coach_system_prompt(address)
+    reply = gpt_reply(sys, txt)
+
+    # не прыгать сразу к структуре: 1–2 свободных обмена → потом предложить «разобрать по шагам»
+    free_cnt = increment_counter(uid, "free_talk_count")
+    if free_cnt >= 2 and any(k in low for k in ["ошиб", "просад", "правил", "стоп", "усредн"]):
+        reply += "\n\nЕсли хочешь, можем аккуратно разобрать это по шагам. Напиши: *разбор ошибки*."
+    bot.send_message(m.chat.id, reply)
+
+# Короткий триггер на «разбор ошибки»
+@bot.message_handler(func=lambda msg: msg.text and msg.text.strip().lower() in ["разбор ошибки","разобрать ошибку","мерседес","давай разбор"])
+def start_error_from_free(m):
+    return intent_error(m)
+
+# ----------------- FLASK / WEBHOOK -----------------
+app = Flask(__name__)
+
+@app.get("/")
+def root():
+    return "OK"
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
+
+@app.post(f"/{WEBHOOK_PATH}")
+def webhook():
+    # проверка секрета
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_WEBHOOK_SECRET:
+        abort(401)
+    if request.content_length and request.content_length > 1_000_000:
+        abort(413)
+    update = request.get_data().decode("utf-8")
+    try:
+        bot.process_new_updates([types.Update.de_json(update)])
+    except Exception as e:
+        log.error(f"process update error: {e}")
+    return jsonify(ok=True)
+
+@app.get("/status")
+def status():
+    return jsonify({
+        "ok": True,
+        "time": datetime.utcnow().isoformat(timespec="seconds")
+    })
+
 def setup_webhook():
+    # удаляем и ставим новый
     try:
         bot.remove_webhook()
-    except Exception as e:
-        log.warning(f"remove_webhook: {e}")
+    except Exception:
+        pass
     url = f"{PUBLIC_URL}/{WEBHOOK_PATH}"
     ok = bot.set_webhook(
         url=url,
         secret_token=TG_WEBHOOK_SECRET,
         allowed_updates=["message","callback_query"],
-        drop_pending_updates=False,
         max_connections=40
     )
-    log.info(f"set_webhook({url}) -> {ok}")
+    log.info(f"Webhook set to {url}: {ok}")
 
 if __name__ == "__main__":
     setup_webhook()
     port = int(os.getenv("PORT", "10000"))
-    log.info(f"Starting Flask on 0.0.0.0:{port}")
+    log.info("Starting web server…")
     app.run(host="0.0.0.0", port=port)
