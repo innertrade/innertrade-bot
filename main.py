@@ -1,401 +1,412 @@
 # main.py
-import os, json, logging
+import os, json, logging, re, threading
 from datetime import datetime, timezone
-
 from flask import Flask, request, jsonify, abort
 from telebot import TeleBot, types
+from openai import OpenAI
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("innertrade")
 
 # ---------- ENV ----------
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")
-DATABASE_URL       = os.getenv("DATABASE_URL")
-PUBLIC_URL         = os.getenv("PUBLIC_URL")
-WEBHOOK_PATH       = os.getenv("WEBHOOK_PATH")  # например: wbhk_9t3x
-TG_WEBHOOK_SECRET  = os.getenv("TG_WEBHOOK_SECRET")  # должен совпадать с secret_token в setWebhook
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL   = os.getenv("DATABASE_URL")  # optional
+PUBLIC_URL     = os.getenv("PUBLIC_URL")    # e.g. https://innertrade-bot.onrender.com
+WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "webhook")
+TG_WEBHOOK_SECRET = os.getenv("TG_WEBHOOK_SECRET")
 
-if not TELEGRAM_TOKEN:    raise RuntimeError("TELEGRAM_TOKEN missing")
-if not OPENAI_API_KEY:    raise RuntimeError("OPENAI_API_KEY missing")
-if not PUBLIC_URL:        raise RuntimeError("PUBLIC_URL missing (e.g., https://your-app.onrender.com)")
-if not WEBHOOK_PATH:      raise RuntimeError("WEBHOOK_PATH missing (e.g., wbhk_XXXX)")
-if not TG_WEBHOOK_SECRET: raise RuntimeError("TG_WEBHOOK_SECRET missing (use same as setWebhook&secret_token=)")
+required = {
+    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "OPENAI_API_KEY": OPENAI_API_KEY,
+    "PUBLIC_URL": PUBLIC_URL,
+    "TG_WEBHOOK_SECRET": TG_WEBHOOK_SECRET
+}
+missing = [k for k,v in required.items() if not v]
+if missing:
+    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
 # ---------- OPENAI ----------
-# Лёгкая обёртка: вызываем Chat Completions только при «свободной беседе».
-from openai import OpenAI
-oai = OpenAI(api_key=OPENAI_API_KEY)
-GPT_MODEL = "gpt-4o-mini"
-
-def coach_reply(user_name: str | None, prompt: str) -> str:
-    """Ненавязчивый ответ-коуч: 1 короткий вопрос + эмпатия. Без ухода из сценария."""
-    sys = (
-        "Ты коуч-трейдинг ассистент Innertrade. Общайся тепло, кратко, по делу. "
-        "Позволь человеку выговориться 1–2 реплики, затем мягко подведи к формулировке "
-        "конкретной проблемы на уровне поведения/навыка (без терминов MERCEDES/TOTE). "
-        "Не давай длинных лекций и не требуй немедленно «вернуться к курсу». "
-        "В конце задай один уточняющий вопрос."
-    )
-    name = user_name or "друг"
-    msgs = [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": f"{name}: {prompt}"}
-    ]
-    try:
-        r = oai.chat.completions.create(model=GPT_MODEL, messages=msgs, temperature=0.4, max_tokens=180)
-        return r.choices[0].message.content.strip()
-    except Exception as e:
-        log.warning(f"OpenAI fallback error: {e}")
-        return "Понимаю. Расскажи ещё чуть подробнее, что конкретно тебя выбивает в моменте?"
+oa = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------- DB ----------
 engine = None
 if DATABASE_URL:
     try:
-        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-        # создадим таблицу user_state, если вдруг её нет
-        with engine.begin() as conn:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+        with engine.connect() as conn:
+            # user_state таблица уже есть в твоей схеме; создаём на всякий случай
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS user_state (
-                user_id BIGINT PRIMARY KEY,
-                intent  TEXT,
-                step    TEXT,
-                data    JSONB,
-                updated_at TIMESTAMPTZ DEFAULT now()
+              user_id BIGINT PRIMARY KEY,
+              intent  TEXT,
+              step    TEXT,
+              data    JSONB,
+              updated_at TIMESTAMPTZ DEFAULT now()
             );
             """))
-        log.info("DB connected")
+        logging.info("DB connected & migrated")
     except OperationalError as e:
-        log.warning(f"DB not reachable: {e}")
+        logging.warning(f"DB not available yet: {e}")
         engine = None
 else:
-    log.info("DATABASE_URL not set — running without DB")
+    logging.info("DATABASE_URL not set — running without DB persistence")
 
-def get_state(uid: int) -> dict:
-    st = {"intent": "idle", "step": None, "data": {}}
-    if not engine: return st
-    row = None
+def load_state(user_id: int) -> dict:
+    if not engine: return {"intent":"greet","step":"warmup","data":{}}
     with engine.begin() as conn:
         row = conn.execute(text("SELECT intent, step, data FROM user_state WHERE user_id=:u"),
-                           {"u": uid}).mappings().first()
-    if row:
-        st["intent"] = row["intent"]
-        st["step"]   = row["step"]
-        st["data"]   = row["data"] or {}
-    return st
+                           {"u": user_id}).mappings().first()
+        if not row:
+            conn.execute(text("""
+                INSERT INTO user_state(user_id, intent, step, data)
+                VALUES (:u, 'greet', 'warmup', '{}'::jsonb)
+                ON CONFLICT (user_id) DO NOTHING
+            """), {"u": user_id})
+            return {"intent":"greet","step":"warmup","data":{}}
+        return {"intent": row["intent"] or "greet",
+                "step": row["step"] or "warmup",
+                "data": row["data"] or {}}
 
-def save_state(uid: int, intent: str | None = None, step: str | None = None, data_patch: dict | None = None):
+def save_state(user_id: int, intent: str=None, step: str=None, data: dict=None):
     if not engine: return
-    cur = get_state(uid)
-    if intent is not None: cur["intent"] = intent
-    if step   is not None: cur["step"]   = step
-    if data_patch:
-        cur["data"] = (cur["data"] or {}) | data_patch
+    cur = load_state(user_id)
+    if intent is None: intent = cur["intent"]
+    if step   is None: step   = cur["step"]
+    merged = cur["data"].copy()
+    if data: merged.update(data)
     with engine.begin() as conn:
         conn.execute(text("""
         INSERT INTO user_state(user_id, intent, step, data, updated_at)
-        VALUES (:u, :i, :s, COALESCE(:d, '{}'::jsonb), now())
+        VALUES (:u, :i, :s, :d, now())
         ON CONFLICT (user_id) DO UPDATE
-        SET intent = EXCLUDED.intent,
-            step   = EXCLUDED.step,
-            data   = EXCLUDED.data,
-            updated_at = now()
-        """), {"u": uid, "i": cur["intent"], "s": cur["step"], "d": json.dumps(cur["data"])})
+        SET intent=:i, step=:s, data=:d, updated_at=now()
+        """), {"u": user_id, "i": intent, "s": step, "d": json.dumps(merged)})
 
-# ---------- TELEGRAM ----------
+# ---------- UI ----------
 bot = TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
 
-def main_menu():
+def main_menu(address="ты"):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🚑 У меня ошибка", "🧩 Хочу стратегию")
     kb.row("📄 Паспорт", "🗒 Панель недели")
     kb.row("🆘 Экстренно: поплыл", "🤔 Не знаю, с чего начать")
+    if address == "вы":
+        # ничего особого — просто пример на будущее
+        pass
     return kb
 
-BOT_PUBLIC_NAME = "Innertrade"
+# ---------- НАТУРАЛЬНЫЙ ДИАЛОГ / ХЕЛПЕРЫ ----------
+INTENT_FREE = "free_talk"     # свободное общение
+INTENT_ERROR = "error_flow"   # разбор ошибки
 
-def ask_name(chat_id: int):
-    bot.send_message(chat_id, "Как тебя зовут? (можно ник)", reply_markup=types.ReplyKeyboardRemove())
+def user_address(data: dict, msg) -> str:
+    # address: "ты"|"вы". По умолчанию "ты".
+    return (data or {}).get("address") or "ты"
 
-def ask_addressing(chat_id: int):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.row("ты", "вы")
-    bot.send_message(chat_id, "Как удобнее обращаться — на *ты* или на *вы*?", reply_markup=kb)
+def reflect_and_question(text_in: str, address: str) -> str:
+    # Короткая эмпатия + один вопрос (без давления).
+    # Не упоминаем названия техник.
+    sys = (
+        "Ты — коуч-наставник по трейдингу. Говори тепло и просто, одно короткое уточняющее "
+        "вопросительное предложение. Не навязывай шаги курса. Не задавай длинные списки. "
+        "Если пользователь назвал проблему, отзеркаль её одной фразой и задай один мягкий вопрос."
+    )
+    usr = f"Адрес обращения: {address}. Сообщение пользователя: «{text_in}»"
+    try:
+        r = oa.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role":"system","content":sys},
+                {"role":"user","content":usr}
+            ],
+            temperature=0.4,
+            max_tokens=180
+        )
+        return r.choices[0].message.content.strip()
+    except Exception:
+        # Фолбэк
+        q = "Что именно в этом волнует больше всего?" if address=="ты" else "Что именно в этом волнует вас больше всего?"
+        return q
 
-# ---------- Команды ----------
+behavior_verbs = re.compile(r"\b(вхожу|войти|закрываю|закрыть|двигаю|двинул|усредняю|усреднить|вмешиваюсь|вмешаться|завышаю|пересиживаю|пересидеть)\b", re.IGNORECASE)
+common_markers = re.compile(r"\b(просадк|стоп|тейк|правил|нарушаю|сетап|ран(о|ьше)|поторопил|паник|страх)\w*", re.IGNORECASE)
+
+def detect_problem_statement(text_in: str) -> bool:
+    # Done-условие для фиксации ошибки: есть глагол поведения ИЛИ маркеры
+    return bool(behavior_verbs.search(text_in) or common_markers.search(text_in)) and len(text_in.split()) >= 3
+
+def paraphrase_problem(text_in: str, address: str) -> str:
+    # Короткая, конкретная переформулировка на уровне поведения/навыка; без названий техник
+    sys = ("Сделай одну короткую конкретную формулировку торговой проблемы на уровне поведения/навыка. "
+           "Не давай советы, не объясняй теории. Не пиши более 1 предложения.")
+    r = oa.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role":"system","content":sys},
+            {"role":"user","content":f"Адрес: {address}. Текст: {text_in}"}
+        ],
+        temperature=0.2,
+        max_tokens=80
+    )
+    return r.choices[0].message.content.strip().strip(" .") + "."
+
+def confirm_kb():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("Да, так и есть", callback_data="confirm_problem_yes"),
+        types.InlineKeyboardButton("Не совсем / уточнить", callback_data="confirm_problem_no"),
+    )
+    return kb
+
+# ---------- КОМАНДЫ ----------
+@bot.message_handler(commands=["start","menu","reset"])
+def cmd_start(m):
+    st = load_state(m.from_user.id)
+    # Сброс в «тёплое» приветствие, имя + как обращаться
+    data = st["data"]
+    # Автозаполняем имя из Telegram, если нет
+    if not data.get("name"):
+        data["name"] = m.from_user.first_name or "друг"
+    # адрес пока неизвестен — спросим
+    data.pop("address", None)
+    save_state(m.from_user.id, intent="greet", step="warmup", data=data)
+    name = data["name"]
+    bot.send_message(
+        m.chat.id,
+        f"👋 Привет, {name}! Давай знакомиться. Как удобнее обращаться — *ты* или *вы*?",
+        reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("ты","вы")
+    )
+
 @bot.message_handler(commands=["ping"])
-def cmd_ping(m):
-    bot.send_message(m.chat.id, "pong")
+def cmd_ping(m): bot.send_message(m.chat.id, "pong")
 
 @bot.message_handler(commands=["status"])
 def cmd_status(m):
-    st = get_state(m.from_user.id)
+    st = load_state(m.from_user.id)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    resp = {
+        "ok": True,
+        "time": now,
+        "intent": st["intent"],
+        "step": st["step"],
+        "db": "ok" if engine else "no-db"
+    }
+    bot.send_message(m.chat.id, f"```\n{json.dumps(resp, ensure_ascii=False, indent=2)}\n```", parse_mode="Markdown")
+
+# ---------- ОТВЕТ НА КНОПКИ ГЛАВНОГО МЕНЮ ----------
+def goto_error_flow(m, st):
+    addr = user_address(st["data"], m)
+    save_state(m.from_user.id, intent=INTENT_ERROR, step="ask_problem")
     bot.send_message(
         m.chat.id,
-        "```\n" + json.dumps({
-            "ok": True,
-            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "intent": st["intent"],
-            "step": st["step"],
-            "db": "ok" if engine else "none"
-        }, ensure_ascii=False, indent=2) + "\n```",
-        parse_mode="Markdown"
+        "Окей, давай разберём твою текущую трудность. Коротко опиши её 1–2 предложениями.",
+        reply_markup=main_menu(addr)
     )
 
-@bot.message_handler(commands=["start", "reset", "menu"])
-def cmd_start(m):
-    uid = m.from_user.id
-    # Сбросим «мягко»: имя и обращение сохраним, если были.
-    st = get_state(uid)
-    name = (st["data"] or {}).get("name")
-    address = (st["data"] or {}).get("address")
-    save_state(uid, intent="greet", step="ask_name" if not name else ("ask_address" if not address else None))
-    greet = f"👋 Привет{', ' + name if name else ''}! "
-    if not name:
-        bot.send_message(m.chat.id, greet + "Давай познакомимся.", reply_markup=types.ReplyKeyboardRemove())
-        ask_name(m.chat.id)
-    elif not address:
-        bot.send_message(m.chat.id, greet + "Как удобнее общаться?", reply_markup=types.ReplyKeyboardRemove())
-        ask_addressing(m.chat.id)
-    else:
-        bot.send_message(m.chat.id, greet + "Выбери пункт или просто расскажи, что болит сейчас.",
-                         reply_markup=main_menu())
+@bot.message_handler(func=lambda msg: msg.text in ["🚑 У меня ошибка","🧩 Хочу стратегию","📄 Паспорт","🗒 Панель недели","🆘 Экстренно: поплыл","🤔 Не знаю, с чего начать"])
+def on_menu_click(m):
+    st = load_state(m.from_user.id)
+    addr = user_address(st["data"], m)
+    t = m.text
+    if t == "🚑 У меня ошибка":
+        goto_error_flow(m, st)
+    elif t == "🆘 Экстренно: поплыл":
+        bot.send_message(m.chat.id,
+            "Стоп-протокол:\n1) Пауза 2 минуты\n2) Закрой терминал/вкладку\n3) 10 медленных вдохов\n"
+            "4) Запиши триггер (что выбило)\n5) Вернись к плану сделки или закрой по правилу",
+            reply_markup=main_menu(addr))
+    elif t == "🤔 Не знаю, с чего начать":
+        bot.send_message(m.chat.id,
+            "Предлагаю так: 1) коротко обозначим боль, 2) зафиксируем ближайшую цель, 3) намечаем шаги. С чего начнём?",
+            reply_markup=main_menu(addr))
+    elif t == "🗒 Панель недели":
+        bot.send_message(m.chat.id,
+            "Панель недели: • фокус недели • 1–2 цели • лимиты • короткие чек-ины • ретроспектива в конце.",
+            reply_markup=main_menu(addr))
+    elif t == "📄 Паспорт":
+        bot.send_message(m.chat.id,
+            "Паспорт трейдера: рынки/ТФ, стиль, риск-настройки, типовые ошибки, триггеры и рабочие ритуалы. Готов добавить позже.",
+            reply_markup=main_menu(addr))
+    elif t == "🧩 Хочу стратегию":
+        bot.send_message(m.chat.id,
+            "Соберём скелет ТС: 1) подход/ТФ/вход, 2) стоп/сопровождение/выход/риски. Начнём при следующем заходе.",
+            reply_markup=main_menu(addr))
 
-# ---------- Интенты-кнопки ----------
-@bot.message_handler(func=lambda msg: msg.text == "🚑 У меня ошибка")
-def btn_error(m):
-    uid = m.from_user.id
-    save_state(uid, intent="error", step="ask_error")
-    bot.send_message(
-        m.chat.id,
-        "Опиши основную проблему в 1–2 предложениях (как ты *действуешь* в моменте).",
-        reply_markup=main_menu()
-    )
-
-@bot.message_handler(func=lambda msg: msg.text == "🧩 Хочу стратегию")
-def btn_strategy(m):
-    uid = m.from_user.id
-    save_state(uid, intent="strategy", step="intro")
-    bot.send_message(
-        m.chat.id,
-        "Соберём каркас ТС:\n1) подход/рынки/ТФ\n2) вход\n3) стоп/сопровождение/выход\n4) риск/лимиты.",
-        reply_markup=main_menu()
-    )
-
-@bot.message_handler(func=lambda msg: msg.text == "📄 Паспорт")
-def btn_passport(m):
-    uid = m.from_user.id
-    save_state(uid, intent="passport", step="q_markets")
-    bot.send_message(m.chat.id, "Паспорт трейдера. 1/6) На каких рынках/инструментах торгуешь?",
-                     reply_markup=main_menu())
-
-@bot.message_handler(func=lambda msg: msg.text == "🗒 Панель недели")
-def btn_weekpanel(m):
-    uid = m.from_user.id
-    save_state(uid, intent="week_panel", step="focus")
-    bot.send_message(m.chat.id, "Панель недели: выбери фокус на ближайшие 5 торговых дней (коротко).",
-                     reply_markup=main_menu())
-
-@bot.message_handler(func=lambda msg: msg.text == "🆘 Экстренно: поплыл")
-def btn_panic(m):
-    uid = m.from_user.id
-    save_state(uid, intent="panic", step=None)
-    bot.send_message(
-        m.chat.id,
-        "Стоп-протокол:\n1) Пауза 2 мин\n2) Закрой график\n3) 10 медленных вдохов\n4) Запиши триггер\n5) Вернись к плану/закрой по правилу.",
-        reply_markup=main_menu()
-    )
-
-@bot.message_handler(func=lambda msg: msg.text == "🤔 Не знаю, с чего начать")
-def btn_start_help(m):
-    uid = m.from_user.id
-    save_state(uid, intent="start_help", step=None)
-    bot.send_message(
-        m.chat.id,
-        "Предлагаю так:\n1) Заполним паспорт (1–2 мин)\n2) Выберем фокус недели\n3) Соберём скелет ТС.\nС чего начнём?",
-        reply_markup=main_menu()
-    )
-
-# ---------- Естественный диалог + сценарии ----------
-def looks_like_greeting(text: str) -> bool:
-    t = text.lower().strip()
-    return any(w in t for w in ["привет", "здрав", "добрый", "hi", "hello"])
-
-def asked_bot_name(text: str) -> bool:
-    t = text.lower()
-    return ("как" in t and "зовут" in t) or ("твое имя" in t) or ("твоё имя" in t)
-
-def maybe_problem_sentence(text: str) -> bool:
-    # примитивный детектор «ошибки»: глаголы действия + торговые термины
-    t = text.lower()
-    verbs = ["вхожу","захожу","выход","двигаю","переношу","фиксир","усредня","добавля","закрыва","открыва"]
-    market = ["сделк","стоп","тейк","сетап","позици","просад","рынок","торгов"]
-    return any(v in t for v in verbs) and any(m in t for m in market)
-
+# ---------- ОБРАБОТКА ТЕКСТА (естественный диалог + шаги) ----------
 @bot.message_handler(content_types=["text"])
 def on_text(m):
-    uid = m.from_user.id
-    st = get_state(uid)
-    text = (m.text or "").strip()
+    st = load_state(m.from_user.id)
+    data = st["data"]; addr = user_address(data, m)
+    txt = (m.text or "").strip().lower()
 
-    # 0) «как тебя зовут?»
-    if asked_bot_name(text):
-        bot.send_message(m.chat.id, f"Я — {BOT_PUBLIC_NAME}. Рад знакомству!")
+    # 1) первичное определение обращения "ты/вы"
+    if st["intent"] == "greet" and st["step"] == "warmup":
+        if txt in ["ты","вы"]:
+            data["address"] = txt
+            # имя уже есть, отвечаем тепло и даём свободный вход
+            save_state(m.from_user.id, intent=INTENT_FREE, step="warmup_1", data=data)
+            sal = "Принято." if txt=="вы" else "Окей."
+            bot.send_message(m.chat.id,
+                f"{sal} Можем спокойно поговорить — расскажи, что сейчас болит в торговле. "
+                f"Если хочешь, снизу есть меню.", reply_markup=main_menu(txt))
+            return
+        # если спросили "как тебя зовут?"
+        if "как тебя зовут" in m.text.lower():
+            bot.send_message(m.chat.id, "Я — Kai. Можно просто Кай 🙂")
+            return
+        # если ответили не «ты/вы» — мягко переспросим
+        bot.send_message(m.chat.id, "Напиши, пожалуйста, «ты» или «вы».")
         return
 
-    # 1) Диалог знакомства: имя → «ты/вы»
-    if st["intent"] == "greet" and (st["step"] in (None, "ask_name", "ask_address")):
-        data = st["data"] or {}
-        if st["step"] in (None, "ask_name"):
-            # Сохраним имя (очистим эмодзи/лишние кавычки по-простому)
-            name = text.strip().strip('«»"\'🙂🥲😀😅🤝').split()[0][:24]
-            if len(name) < 1: name = None
-            if name:
-                save_state(uid, step="ask_address", data_patch={"name": name})
-                ask_addressing(m.chat.id)
-            else:
-                bot.send_message(m.chat.id, "Не расслышал имя. Можно просто коротко — как к тебе обращаться?")
-            return
-        if st["step"] == "ask_address":
-            t = text.lower()
-            if t in ("ты","вы"):
-                save_state(uid, intent="idle", step=None, data_patch={"address": t})
-                greet = f"Принято, { (st['data'] or {}).get('name') or '' }."
-                bot.send_message(m.chat.id, f"{greet} Можем просто поговорить или выбрать пункт в меню.", reply_markup=main_menu())
-            else:
-                ask_addressing(m.chat.id)
+    # 2) свободная беседа (до 2–3 тёплых заходов) с авто-детектом проблемы
+    if st["intent"] == INTENT_FREE:
+        # если прямой вопрос «как тебя зовут»
+        if "как тебя зовут" in m.text.lower():
+            bot.send_message(m.chat.id, "Я — Kai. Можно просто Кай.")
             return
 
-    # 2) Кнопка «ошибка» (первый шаг): пользователь написал ошибку?
-    if st["intent"] == "error":
-        if st["step"] == "ask_error":
-            # мягкая конкретизация: если абстрактно — один уточняющий вопрос; если достаточно — резюме и подтверждение
-            if not maybe_problem_sentence(text):
-                save_state(uid, step="nudge_error")
-                bot.send_message(
-                    m.chat.id,
-                    "Понял. Чтобы точнее помочь, уточни, пожалуйста: *что именно ты делаешь* (глаголами) и *в какой момент*?\nНапример: «вхожу до формирования сигнала», «двигаю стоп после входа».",
-                    reply_markup=main_menu()
-                )
-            else:
-                # Короткое резюме и подтверждение
-                save_state(uid, step="confirm_error", data_patch={"error_text": text})
-                bot.send_message(
-                    m.chat.id,
-                    f"Зафиксировал так:\n> {text}\n\nПодходит формулировка? Напиши *да* или скорректируй своими словами."
-                )
-            return
-        if st["step"] == "nudge_error":
-            # второе приближение: примем как есть
-            save_state(uid, step="confirm_error", data_patch={"error_text": text})
-            bot.send_message(
-                m.chat.id,
-                f"Ок, записал:\n> {text}\n\nПодходит формулировка? Напиши *да* или поправь."
-            )
-            return
-        if st["step"] == "confirm_error":
-            if text.lower() in ("да","ок","подходит","верно","ага"):
-                # переход к MERCEDES (без терминов)
-                save_state(uid, step="mer_context")
-                bot.send_message(m.chat.id, "Начнём разбор. *Ситуация*: в какой момент это обычно случается? Что предшествует? (1–2 предложения)")
-                return
-            else:
-                # пользователь уточнил формулировку — примем и пойдём дальше
-                save_state(uid, step="mer_context", data_patch={"error_text": text})
-                bot.send_message(m.chat.id, "Принято. *Ситуация*: когда это обычно случается? Что предшествует?")
-                return
-        # Короткая «MERCEDES» без терминов
-        if st["step"] == "mer_context":
-            save_state(uid, step="mer_emotions", data_patch={"mer_context": text})
-            bot.send_message(m.chat.id, "Эмоции: что чувствуешь в этот момент? (несколько слов)")
-            return
-        if st["step"] == "mer_emotions":
-            save_state(uid, step="mer_thoughts", data_patch={"mer_emotions": text})
-            bot.send_message(m.chat.id, "Мысли: что говоришь себе? (1–2 короткие фразы)")
-            return
-        if st["step"] == "mer_thoughts":
-            save_state(uid, step="mer_behavior", data_patch={"mer_thoughts": text})
-            bot.send_message(m.chat.id, "Действия: что конкретно делаешь? (глаголами, 1–2 предложения)")
-            return
-        if st["step"] == "mer_behavior":
-            # резюме — *интерпретация*, а не копипаст
-            st2 = get_state(uid)
-            d = st2["data"] or {}
-            error_text = d.get("error_text","ошибка")
-            resume = (
-                f"Вижу паттерн: при «{d.get('mer_context','…')}» "
-                f"возникают «{d.get('mer_emotions','…')}», мысли «{d.get('mer_thoughts','…')}», "
-                f"и ты делаешь «{text}», что приводит к ошибке «{error_text}»."
-            )
-            save_state(uid, step="goal_new", data_patch={"mer_behavior": text, "pattern_resume": resume})
-            bot.send_message(m.chat.id, f"{resume}\n\nСформулируем новую цель как *поведение*: как ты хочешь действовать в следующий раз? (1–2 предложения, наблюдаемо)")
-            return
-        if st["step"] == "goal_new":
-            # переход к «TOTE» (без терминов)
-            save_state(uid, step="tote_ops", data_patch={"positive_goal": text})
-            bot.send_message(m.chat.id, "Ок. Какие *конкретные шаги* помогут удерживать новое поведение? (чек-лист 2–4 пункта)")
-            return
-        if st["step"] == "tote_ops":
-            save_state(uid, step="tote_check", data_patch={"tote_ops": text})
-            bot.send_message(m.chat.id, "Как проверишь, что получилось? (критерий на 1–3 сделки)")
-            return
-        if st["step"] == "tote_check":
-            save_state(uid, step=None, intent="idle", data_patch={"tote_check": text})
-            bot.send_message(
-                m.chat.id,
-                "Готово! Мы зафиксировали:\n— проблему\n— паттерн\n— новую цель\n— шаги и проверку.\n"
-                "Можем добавить это в фокус недели или вернуться в меню.",
-                reply_markup=main_menu()
-            )
+        # подбираем мягкий ответ
+        reply = reflect_and_question(m.text, addr)
+
+        # копим warmup count
+        wc = int(data.get("warmup_count", 0)) + 1
+        data["warmup_count"] = wc
+
+        # если пользователь уже дал годную формулировку — предлагаем подтвердить
+        if detect_problem_statement(m.text):
+            short = paraphrase_problem(m.text, addr)
+            save_state(m.from_user.id, intent=INTENT_ERROR, step="confirm_problem",
+                       data={**data, "problem_candidate": short})
+            bot.send_message(m.chat.id, f"Зафиксирую так: *{short}*\nПодходит?", reply_markup=confirm_kb())
             return
 
-    # 3) Свободный диалог: GPT помогает «мягко» и удерживает рамку
-    #    (но если распознан «ошибочный» текст — переведём в сценарий «ошибка»).
-    if maybe_problem_sentence(text) and st["intent"] not in ("error",):
-        save_state(uid, intent="error", step="confirm_error", data_patch={"error_text": text})
-        bot.send_message(
-            m.chat.id,
-            f"Понял тебя так:\n> {text}\n\nПодходит формулировка? Напиши *да* или поправь.",
-            reply_markup=main_menu()
-        )
+        # после 2 заходов — мягко предложить обозначить конкретнее и перейти
+        if wc >= 2:
+            tip = "Если ок, сформулируй в одном предложении: что именно ты обычно *делаешь* не так (на уровне действия)."
+            bot.send_message(m.chat.id, f"{reply}\n\n{tip}", reply_markup=main_menu(addr))
+        else:
+            bot.send_message(m.chat.id, reply, reply_markup=main_menu(addr))
+        save_state(m.from_user.id, data=data)
         return
 
-    # иначе — одна короткая коуч-реплика от GPT
-    name = (st["data"] or {}).get("name")
-    reply = coach_reply(name, text)
-    bot.send_message(m.chat.id, reply, reply_markup=main_menu())
+    # 3) поток «разбор ошибки»
+    if st["intent"] == INTENT_ERROR:
+        step = st["step"]
 
-# ---------- FLASK / WEBHOOK ----------
+        # A) шаг: спросить проблему, принять свободный текст, попытаться конкретизировать, подтвердить
+        if step == "ask_problem":
+            if not detect_problem_statement(m.text):
+                hint = "Опиши, *что именно делаешь* или *как это проявляется* в сделке (1–2 предложения)."
+                bot.send_message(m.chat.id, f"Понял. Дай, пожалуйста, чуть конкретнее. {hint}",
+                                 reply_markup=main_menu(addr))
+                return
+            short = paraphrase_problem(m.text, addr)
+            save_state(m.from_user.id, step="confirm_problem", data={**data, "problem_candidate": short})
+            bot.send_message(m.chat.id, f"Так сформулируем: *{short}*\nПодходит?", reply_markup=confirm_kb())
+            return
+
+        # B) после подтверждения — идём в мягкий опрос (без названий техник)
+        if step == "context":
+            bot.send_message(m.chat.id, "В какой ситуации это обычно происходит? Что предшествует? (1–2 предложения)",
+                             reply_markup=main_menu(addr))
+            save_state(m.from_user.id, step="context_wait")
+            return
+        if step == "context_wait":
+            save_state(m.from_user.id, step="emotions", data={**data, "ctx": m.text})
+            bot.send_message(m.chat.id, "Что чувствуешь в момент этой ошибки? (несколько слов)")
+            return
+        if step == "emotions":
+            save_state(m.from_user.id, step="thoughts", data={**data, "emo": m.text})
+            bot.send_message(m.chat.id, "Что говоришь себе в этот момент? (1–2 фразы)")
+            return
+        if step == "thoughts":
+            save_state(m.from_user.id, step="behavior", data={**data, "thoughts": m.text})
+            bot.send_message(m.chat.id, "И что именно ты делаешь? Опиши действие глаголами (1–2 предложения).")
+            return
+        if step == "behavior":
+            # Итог мини-резюме без навязывания терминов
+            data.update({"beh": m.text})
+            problem = data.get("problem_confirmed") or data.get("problem_candidate") or "ошибка"
+            resume = f"Резюме: {problem}\nКонтекст: {data.get('ctx','—')}\nЭмоции: {data.get('emo','—')}\nМысли: {data.get('thoughts','—')}\nПоведение: {data.get('beh','—')}"
+            bot.send_message(m.chat.id, f"Ок, вижу картину.\n\n{resume}\n\nСформулируем новую цель одним предложением (что хочешь делать вместо прежнего поведения)?")
+            save_state(m.from_user.id, step="new_goal", data=data)
+            return
+        if step == "new_goal":
+            goal = m.text.strip()
+            # мягкий переход в план (аналог TOTE, без названия)
+            save_state(m.from_user.id, step="mini_plan", data={**data, "new_goal": goal})
+            bot.send_message(m.chat.id, "Какие 2–3 шага помогут держаться этой цели в ближайших 3 сделках?")
+            return
+        if step == "mini_plan":
+            plan = m.text.strip()
+            goal = data.get("new_goal","Цель")
+            bot.send_message(m.chat.id, f"Отлично. Цель: *{goal}*\nШаги: {plan}\n\nГотово. Можем добавить это в недельный фокус позже.")
+            save_state(m.from_user.id, intent=INTENT_FREE, step="warmup_1", data=data)
+            return
+
+    # 4) общий фолбэк — естественный короткий ответ + приглашение к меню
+    reply = reflect_and_question(m.text, addr)
+    bot.send_message(m.chat.id, reply + "\n\n(Снизу есть меню на случай, если удобнее кнопками.)", reply_markup=main_menu(addr))
+
+# ---------- CALLBACKS (подтверждение формулировки) ----------
+@bot.callback_query_handler(func=lambda c: c.data in ["confirm_problem_yes","confirm_problem_no"])
+def cb_confirm(call):
+    st = load_state(call.from_user.id); data = st["data"]; addr = user_address(data, call)
+    if call.data == "confirm_problem_yes":
+        confirmed = data.get("problem_candidate") or "ошибка"
+        save_state(call.from_user.id, intent=INTENT_ERROR, step="context",
+                   data={**data, "problem_confirmed": confirmed})
+        bot.answer_callback_query(call.id, "Зафиксировали.")
+        bot.send_message(call.message.chat.id, "Принято. Двигаемся дальше шаг за шагом.", reply_markup=main_menu(addr))
+    else:
+        save_state(call.from_user.id, intent=INTENT_ERROR, step="ask_problem", data=data)
+        bot.answer_callback_query(call.id, "Ок, уточним формулировку.")
+        bot.send_message(call.message.chat.id, "Сформулируй по-другому в одном предложении, как ты это видишь.", reply_markup=main_menu(addr))
+
+# ---------- FLASK (webhook, health) ----------
 app = Flask(__name__)
-
-@app.get("/")
-def root():
-    return "OK", 200
 
 @app.get("/health")
 def health():
-    return jsonify({"status":"ok","time": datetime.now(timezone.utc).isoformat()})
+    return jsonify({"status":"ok","time":datetime.now(timezone.utc).isoformat()})
 
 @app.post(f"/{WEBHOOK_PATH}")
-def tg_webhook():
-    # проверка секрета
+def webhook():
+    # Безопасность
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_WEBHOOK_SECRET:
         abort(401)
-    if not request.is_json:
-        abort(400)
-    upd = request.get_json(force=True, silent=True)
+    if request.content_length and request.content_length > 1_000_000:
+        abort(413)
+    update = request.get_data().decode("utf-8", errors="ignore")
     try:
-        update = types.Update.de_json(upd)
-        bot.process_new_updates([update])
+        bot.process_new_updates([types.Update.de_json(json.loads(update))])
     except Exception as e:
-        log.exception(f"Webhook update error: {e}")
+        logging.exception("update handling failed: %s", e)
     return "OK", 200
 
+# ---------- СЕТАП ВЕБХУКА ----------
+def setup_webhook():
+    import requests
+    url = f"{PUBLIC_URL}/{WEBHOOK_PATH}"
+    r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+                     params={
+                         "url": url,
+                         "secret_token": TG_WEBHOOK_SECRET,
+                         "allowed_updates": "message,callback_query",
+                         "drop_pending_updates": "true"
+                     }, timeout=10)
+    logging.info("Webhook set resp: %s", r.text)
+
 if __name__ == "__main__":
+    # Установим вебхук при старте
+    try:
+        setup_webhook()
+    except Exception as e:
+        logging.warning("Webhook setup warn: %s", e)
+
     port = int(os.getenv("PORT","10000"))
-    log.info("Starting Flask webhook server…")
+    logging.info("Starting server on 0.0.0.0:%s", port)
     app.run(host="0.0.0.0", port=port)
