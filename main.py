@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot (Production Ready)
-# Версия: 2025-09-02-mentor-v3
+# Версия: 2025-09-04-mentor-v5
 
 import os
 import json
@@ -66,6 +66,7 @@ STEP_TOTE_OPS = "tote_ops"
 STEP_TOTE_TEST = "tote_test"
 STEP_TOTE_EXIT = "tote_exit"
 STEP_DONE = "done"
+STEP_CONFIRM_PROBLEM = "confirm_problem"
 
 MER_ORDER = [STEP_MER_CTX, STEP_MER_EMO, STEP_MER_THO, STEP_MER_BEH]
 
@@ -193,7 +194,9 @@ def detect_trading_patterns(text: str) -> List[str]:
         "break_even": ["безубыток", "в ноль", "без убытка"],
         "small_profit": ["мелкий профит", "небольшую прибыль", "скорее зафиксировать"],
         "self_doubt": ["не уверен", "сомневаюсь", "неуверенность"],
-        "fear_of_loss": ["страх потерять", "боюсь потерять", "страх убытка"]
+        "fear_of_loss": ["страх потерять", "боюсь потерять", "страх убытка"],
+        "chaos": ["хаос", "топчусь на месте", "не знаю с чего начать"],
+        "rule_breaking": ["нарушаю правила", "не соблюдаю правила", "игнорирую правила"]
     }
     
     detected = []
@@ -223,14 +226,67 @@ def anti_echo(user_text: str, model_text: str) -> str:
         return "Понял. Скажу по-своему: " + m
     return m
 
+def remove_template_phrases(text: str) -> str:
+    """Удаляет шаблонные фразы из ответа бота"""
+    template_phrases = [
+        "Понимаю, это", "Я понимаю, что", "Это может быть", "Важно понять", 
+        "Сложности с", "Давай разберем", "Это распространённая проблема",
+        "Можешь рассказать", "Как ты обычно", "Что именно вызывает",
+        "Какие конкретно", "Как долго", "В каких ситуациях", "Понимаю, как",
+        "Скажи,", "Расскажи,", "Важно", "Обычно", "Часто"
+    ]
+    
+    for phrase in template_phrases:
+        text = re.sub(rf"{phrase}[^.!?]*?[.!?]", "", text, flags=re.IGNORECASE)
+    
+    # Удаляем лишние пробелы и знаки препинания
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'^[,\s\.!?]+', '', text)
+    
+    return text
+
 def mer_prompt_for(step: str) -> str:
     prompts = {
-        STEP_MER_CTX: "КОНТЕКСТ. В какой ситуации это обычно происходит? Что предшествует? (1–2 коротких предложения)",
-        STEP_MER_EMO: "ЭМОЦИИ. Что чувствуешь в момент ошибки? (несколько слов)",
-        STEP_MER_THO: "МЫСЛИ. Какие фразы крутятся в голове? (1–2 коротких)",
-        STEP_MER_BEH: "ПОВЕДЕНИЕ. Что именно ты делаешь? Опиши действия глаголами.",
+        STEP_MER_CTX: "В какой ситуации это обычно происходит? Что предшествует?",
+        STEP_MER_EMO: "Что чувствуешь в момент ошибки?",
+        STEP_MER_THO: "Какие фразы крутятся в голове?",
+        STEP_MER_BEH: "Что именно ты делаешь? Опиши действия.",
     }
     return prompts.get(step, "Продолжим.")
+
+def extract_problem_summary(history: List[Dict]) -> str:
+    """Извлекает и резюмирует проблему из истории диалога"""
+    user_messages = [msg["content"] for msg in history if msg.get("role") == "user"]
+    patterns = []
+    
+    for msg in user_messages:
+        detected = detect_trading_patterns(msg)
+        patterns.extend(detected)
+    
+    # Уникальные паттерны
+    unique_patterns = list(set(patterns))
+    
+    # Формируем резюме на основе обнаруженных паттернов
+    summary_parts = []
+    if "self_doubt" in unique_patterns:
+        summary_parts.append("Неуверенность в себе и своих решениях")
+    if "fear_of_loss" in unique_patterns:
+        summary_parts.append("Страх потерь")
+    if "remove_stop" in unique_patterns or "move_stop" in unique_patterns:
+        summary_parts.append("Нарушение правил управления рисками")
+    if "early_close" in unique_patterns:
+        summary_parts.append("Преждевременное закрытие позиций")
+    if "averaging" in unique_patterns:
+        summary_parts.append("Склонность к усреднению убыточных позиций")
+    if "chaos" in unique_patterns:
+        summary_parts.append("Ощущение хаоса и отсутствия прогресса")
+    if "rule_breaking" in unique_patterns:
+        summary_parts.append("Систематическое нарушение торговых правил")
+    
+    if summary_parts:
+        return "Основные проблемы: " + ", ".join(summary_parts)
+    
+    return "Нужно глубже разобраться в ситуации"
 
 # ========= Voice Handling =========
 def transcribe_voice(audio_file_path: str) -> Optional[str]:
@@ -286,8 +342,11 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         7. Сохраняй empathetic тон, но без шаблонных фраз
         8. Будь кратким в повседневном общении (1-2 абзаца)
         9. При детекции кризиса переходи в режим поддержки
+        10. После выявления проблемы предлагай её разбор через подтверждение
+        11. Избегай общих фраз и советов
+        12. Фокусируйся на конкретных действиях и решениях
         
-        Ответ отдавай строка JSON с ключами: next_step, intent, response_text, store(объект), is_structural(true/false).
+        Ответ отдавай строкой JSON с ключами: next_step, intent, response_text, store(объект), is_structural(true/false).
         """
 
         msgs = [{"role": "system", "content": system_prompt}]
@@ -299,7 +358,7 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         res = oai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs,
-            temperature=0.3,
+            temperature=0.1,  # Пониженная температура для более предсказуемых ответов
             response_format={"type": "json_object"},
         )
         raw = res.choices[0].message.content or "{}"
@@ -314,6 +373,8 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
             dec["is_structural"] = False
 
         dec["response_text"] = anti_echo(text_in, dec["response_text"])
+        # Очищаем от шаблонных фраз
+        dec["response_text"] = remove_template_phrases(dec["response_text"])
         return dec
 
     except Exception as e:
@@ -401,7 +462,7 @@ def handle_text_message(uid: int, text: str, original_message=None):
         if text.lower() in ("ты", "вы"):
             st["data"]["style"] = text.lower()
             save_state(uid, intent=INTENT_FREE, step=STEP_FREE_INTRO, data=st["data"])
-            bot.send_message(uid, f"Принято ({text}). Расскажи, что сейчас происходит в твоей торговле?", reply_markup=MAIN_MENU)
+            bot.send_message(uid, f"Принято ({text}). Что сейчас происходит в твоей торговле?", reply_markup=MAIN_MENU)
         else:
             save_state(uid, data=st["data"])
             bot.send_message(uid, "Пожалуйста, выбери «ты» или «вы».", reply_markup=style_kb())
@@ -442,14 +503,16 @@ def handle_text_message(uid: int, text: str, original_message=None):
     else:
         bot.send_message(uid, resp, reply_markup=MAIN_MENU)
     
-    # Проактивное предложение помощи
-    if suggest_analysis and new_intent != INTENT_ERR:
+    # Проактивное предложение помощи с подтверждением проблемы
+    if suggest_analysis and new_intent != INTENT_ERR and not st["data"].get("problem_confirmed"):
+        problem_summary = extract_problem_summary(history)
+        
         bot.send_message(
             uid, 
-            "Похоже, это системная проблема. Хочешь разберем её подробно?",
+            f"Кажется, я понял твою основную проблему:\n\n{problem_summary}\n\nВерно?",
             reply_markup=types.InlineKeyboardMarkup().row(
-                types.InlineKeyboardButton("Да, давай разберем", callback_data="deep_analysis_yes"),
-                types.InlineKeyboardButton("Пока нет", callback_data="deep_analysis_no")
+                types.InlineKeyboardButton("Да, верно", callback_data="confirm_problem"),
+                types.InlineKeyboardButton("Нет, не совсем", callback_data="reject_problem")
             )
         )
 
@@ -482,7 +545,7 @@ def handle_structural_flow(uid: int, text_in: str, st: Dict[str, Any]):
             bot.send_message(uid, mer_prompt_for(next_step))
         else:
             save_state(uid, intent=INTENT_ERR, step=STEP_GOAL, data=new_data)
-            bot.send_message(uid, "Теперь сформулируй <b>позитивную цель</b>: что хочешь делать вместо прежнего поведения? (одно предложение)")
+            bot.send_message(uid, "Теперь сформулируй позитивную цель: что хочешь делать вместо прежнего поведения?")
         return
 
     # c) Goal
@@ -490,7 +553,7 @@ def handle_structural_flow(uid: int, text_in: str, st: Dict[str, Any]):
         new_data = st["data"].copy()
         new_data["goal"] = text_in
         save_state(uid, intent=INTENT_ERR, step=STEP_TOTE_OPS, data=new_data)
-        bot.send_message(uid, "Отлично. Назови 2–3 конкретных шага (операции), которые помогут удержать цель в ближайших 3 сделках.")
+        bot.send_message(uid, "Отлично. Назови 2–3 конкретных шага, которые помогут удержать цель в ближайших 3 сделках.")
         return
 
     # d) TOTE - operations
@@ -500,7 +563,7 @@ def handle_structural_flow(uid: int, text_in: str, st: Dict[str, Any]):
         new_data = st["data"].copy()
         new_data["tote"] = tote
         save_state(uid, intent=INTENT_ERR, step=STEP_TOTE_TEST, data=new_data)
-        bot.send_message(uid, "Как поймёшь, что получилось? Дай один простой критерий проверки (например: «3 сделки подряд без сдвига стопа»).")
+        bot.send_message(uid, "Как поймёшь, что получилось? Дай один простой критерий проверки.")
         return
 
     # e) TOTE - test
@@ -510,7 +573,7 @@ def handle_structural_flow(uid: int, text_in: str, st: Dict[str, Any]):
         new_data = st["data"].copy()
         new_data["tote"] = tote
         save_state(uid, intent=INTENT_ERR, step=STEP_TOTE_EXIT, data=new_data)
-        bot.send_message(uid, "Что сделаешь, если проверка покажет «не получилось»? (например, «стоп-процедура и пауза»)")
+        bot.send_message(uid, "Что сделаешь, если проверка покажет «не получилось»?")
         return
 
     # f) TOTE - exit (final)
@@ -528,9 +591,9 @@ def handle_structural_flow(uid: int, text_in: str, st: Dict[str, Any]):
             f"Мысли: {new_data.get('mer', {}).get(STEP_MER_THO, '—')}",
             f"Поведение: {new_data.get('mer', {}).get(STEP_MER_BEH, '—')}",
             f"Цель: {new_data.get('goal', '—')}",
-            f"Шаги (OPS): {new_data.get('tote', {}).get('ops', '—')}",
+            f"Шаги: {new_data.get('tote', {}).get('ops', '—')}",
             f"Проверка: {new_data.get('tote', {}).get('test', '—')}",
-            f"Если не вышло (EXIT): {new_data.get('tote', {}).get('exit', '—')}",
+            f"Если не вышло: {new_data.get('tote', {}).get('exit', '—')}",
         ]
         save_state(uid, intent=INTENT_FREE, step=STEP_FREE_INTRO, data=new_data)
         bot.send_message(uid, "\n".join(summary), reply_markup=MAIN_MENU)
@@ -543,11 +606,11 @@ def on_callback(call: types.CallbackQuery):
     data = call.data or ""
     bot.answer_callback_query(call.id, "Ок")
     
-    if data == "deep_analysis_yes":
-        save_state(uid, intent=INTENT_ERR, step=STEP_ERR_DESCR)
+    if data == "confirm_problem":
+        save_state(uid, intent=INTENT_ERR, step=STEP_ERR_DESCR, data={"problem_confirmed": True})
         bot.send_message(uid, "Отлично! Опиши последний случай, когда это произошло:")
-    elif data == "deep_analysis_no":
-        bot.send_message(uid, "Хорошо, как скажешь. Если передумаешь — просто напиши об этом.", reply_markup=MAIN_MENU)
+    elif data == "reject_problem":
+        bot.send_message(uid, "Хорошо, давай уточним. В чём я ошибся?", reply_markup=MAIN_MENU)
 
 # ========= Menu Handlers =========
 MENU_BTNS = {
@@ -594,7 +657,7 @@ def health():
 
 @app.get("/status")
 def status():
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat(), "version": "2025-09-02-mentor-v3"})
+    return jsonify({"ok": True, "time": datetime.utcnow().isoformat(), "version": "2025-09-04-mentor-v5"})
 
 @app.post(f"/{WEBHOOK_PATH}")
 def webhook():
