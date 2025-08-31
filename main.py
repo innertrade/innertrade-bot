@@ -1,20 +1,23 @@
 # main.py — Innertrade Kai Mentor Bot (Production Ready)
-# Версия: 2025-08-30-prod
+# Версия: 2025-09-01-mentor-v2
 
 import os
 import json
 import time
 import logging
 import threading
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 from difflib import SequenceMatcher
 
+import requests
 from flask import Flask, request, abort, jsonify
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 import telebot
 from telebot import types
+from openai import OpenAI
 
 # ========= ENV =========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -70,7 +73,6 @@ MER_ORDER = [STEP_MER_CTX, STEP_MER_EMO, STEP_MER_THO, STEP_MER_BEH]
 oai_client = None
 if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
     try:
-        from openai import OpenAI
         oai_client = OpenAI(api_key=OPENAI_API_KEY)
         log.info("OpenAI client initialized")
     except Exception as e:
@@ -180,6 +182,34 @@ def style_kb() -> types.ReplyKeyboardMarkup:
     kb.row("ты", "вы")
     return kb
 
+# ========= Pattern Detection =========
+def detect_trading_patterns(text: str) -> List[str]:
+    """Детекция паттернов нарушения правил"""
+    patterns = {
+        "remove_stop": ["убираю стоп", "убираю стоп-лосс", "снимаю стоп"],
+        "move_stop": ["двигаю стоп", "передвигаю стоп", "переставляю стоп"],
+        "early_close": ["закрыть позицию", "раньше времени закрыть"],
+        "averaging": ["усреднение", "докупать", "добавляться"],
+        "break_even": ["безубыток", "в ноль", "без убытка"],
+        "small_profit": ["мелкий профит", "небольшую прибыль", "скорее зафиксировать"]
+    }
+    
+    detected = []
+    text_lower = text.lower()
+    for pattern, keywords in patterns.items():
+        if any(keyword in text_lower for keyword in keywords):
+            detected.append(pattern)
+    
+    return detected
+
+def should_suggest_deep_analysis(text: str, patterns: List[str]) -> bool:
+    """Когда предлагать глубокий разбор"""
+    crisis_words = ["систематически", "давно", "не могу", "не получается", "постоянно"]
+    has_crisis = any(word in text.lower() for word in crisis_words)
+    has_patterns = len(patterns) >= 2
+    
+    return has_crisis or has_patterns
+
 # ========= Helpers =========
 def anti_echo(user_text: str, model_text: str) -> str:
     u = (user_text or "").strip().lower()
@@ -200,6 +230,24 @@ def mer_prompt_for(step: str) -> str:
     }
     return prompts.get(step, "Продолжим.")
 
+# ========= Voice Handling =========
+def transcribe_voice(audio_file_path: str) -> Optional[str]:
+    """Транскрибация голосового сообщения через Whisper"""
+    if not oai_client:
+        return None
+        
+    try:
+        with open(audio_file_path, "rb") as audio_file:
+            transcript = oai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                language="ru"
+            )
+            return transcript.text
+    except Exception as e:
+        log.error("Voice transcription error: %s", e)
+        return None
+
 # ========= GPT Decision Maker =========
 def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
     fallback = {
@@ -214,15 +262,27 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         history = st["data"].get("history", [])
-        system_prompt = (
-            "Ты — тёплый наставник по трейдингу. Веди естественный диалог, но сохраняй траекторию: "
-            "сначала уточнение проблемы и согласование формулировки на уровне поведения/навыка, "
-            "затем мягкий переход к MERCEDES (контекст, эмоции, мысли, поведение), "
-            "после — позитивная цель и TOTE (шаги, проверка, выход). "
-            "Если проблема уже конкретна — не проси описывать её заново, просто подтверди и двигайся дальше. "
-            "Не цитируй собеседника дословно; резюмируй коротко своими словами. "
-            "Ответ отдавай строго JSON с ключами: next_step, intent, response_text, store(объект), is_structural(true/false)."
-        )
+        
+        # Добавляем контекст о паттернах и стиле общения
+        style = st["data"].get("style", "ты")
+        patterns = detect_trading_patterns(text_in)
+        patterns_text = ", ".join(patterns) if patterns else "не обнаружено"
+        
+        system_prompt = f"""
+        Ты — тёплый наставник по трейдингу по имени Алекс. Веди естественный диалог, но сохраняй траекторию.
+        Всегда обращайся на {style}, как выбрал пользователь.
+        
+        Обнаруженные паттерны: {patterns_text}
+        
+        Важные правила:
+        1. Никогда не упоминай названия методик (MERCEDES, TOTE) без прямого запроса пользователя
+        2. Будь проактивным - при обнаружении проблем предлагай глубокий разбор
+        3. Сохраняй empathetic тон
+        4. Будь кратким в повседневном общении (1-2 абзаца)
+        5. При детекции кризиса переходи в режим поддержки
+        
+        Ответ отдавай строго JSON с ключами: next_step, intent, response_text, store(объект), is_structural(true/false).
+        """
 
         msgs = [{"role": "system", "content": system_prompt}]
         for h in history[-HIST_LIMIT:]:
@@ -283,54 +343,114 @@ def cmd_reset(m: types.Message):
     )
 
 # ========= Media Handler =========
-@bot.message_handler(content_types=['photo', 'video', 'document', 'audio', 'sticker', 'voice', 'video_note', 'location'])
-def handle_media(m: types.Message):
-    bot.reply_to(m, "Пока работаю только с текстом. Напиши, пожалуйста, сообщением.")
+@bot.message_handler(content_types=['voice', 'audio'])
+def handle_voice(message: types.Message):
+    """Обработка голосовых сообщений"""
+    try:
+        uid = message.from_user.id
+        bot.send_chat_action(uid, 'typing')
+        
+        # Скачиваем голосовое сообщение
+        file_info = bot.get_file(message.voice.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Сохраняем временный файл
+        voice_path = f"temp_voice_{uid}.ogg"
+        with open(voice_path, 'wb') as f:
+            f.write(downloaded_file)
+        
+        # Транскрибируем
+        text = transcribe_voice(voice_path)
+        
+        # Удаляем временный файл
+        try:
+            os.remove(voice_path)
+        except:
+            pass
+        
+        if text:
+            # Обрабатываем как текстовое сообщение
+            handle_text_message(uid, text, message)
+        else:
+            bot.reply_to(message, "Не удалось распознать голосовое сообщение. Попробуй еще раз или напиши текстом.")
+            
+    except Exception as e:
+        log.error("Voice processing error: %s", e)
+        bot.reply_to(message, "Произошла ошибка при обработке голоса. Попробуй написать текстом.")
 
-# ========= Menu Handlers =========
-MENU_BTNS = {
-    "🚑 У меня ошибка": "error",
-    "🧩 Хочу стратегию": "strategy",
-    "📄 Паспорт": "passport",
-    "🗒 Панель недели": "weekpanel",
-    "🆘 Экстренно": "panic",
-    "🤔 Не знаю, с чего начать": "start_help",
-}
-
-@bot.message_handler(func=lambda m: m.text in MENU_BTNS.keys())
-def handle_menu(m: types.Message):
-    uid = m.from_user.id
+def handle_text_message(uid: int, text: str, original_message=None):
+    """Обработка текстовых сообщений (общая функция)"""
     st = load_state(uid)
-    label = m.text
-    code = MENU_BTNS[label]
+    log.info("User %s: intent=%s step=%s text='%s'", uid, st["intent"], st["step"], text[:80])
 
-    # history
+    # Update history (user)
     history = st["data"].get("history", [])
     if len(history) >= HIST_LIMIT:
         history = history[-(HIST_LIMIT-1):]
-    history.append({"role": "user", "content": label})
+    history.append({"role": "user", "content": text})
     st["data"]["history"] = history
 
-    if code == "error":
-        save_state(uid, intent=INTENT_ERR, step=STEP_ERR_DESCR, data=st["data"])
-        bot.send_message(uid, "Коротко опиши текущую ошибку (1–2 предложения). Если уже формулировали выше — можно кратко.")
-    elif code == "start_help":
-        bot.send_message(uid, "Предлагаю так: 1) Паспорт, 2) Фокус недели, 3) Скелет ТС. С чего начнём?", reply_markup=MAIN_MENU)
-        save_state(uid, data=st["data"])
-    else:
-        bot.send_message(uid, "Окей. Если хочешь ускориться — начнём с разбора ошибки.", reply_markup=MAIN_MENU)
-        save_state(uid, data=st["data"])
+    # Greeting: style selection
+    if st["intent"] == INTENT_GREET and st["step"] == STEP_ASK_STYLE:
+        if text.lower() in ("ты", "вы"):
+            st["data"]["style"] = text.lower()
+            save_state(uid, intent=INTENT_FREE, step=STEP_FREE_INTRO, data=st["data"])
+            bot.send_message(uid, f"Принято ({text}). Расскажи, что сейчас болит в торговле.", reply_markup=MAIN_MENU)
+        else:
+            save_state(uid, data=st["data"])
+            bot.send_message(uid, "Пожалуйста, выбери «ты» или «вы».", reply_markup=style_kb())
+        return
 
-# ========= Callback =========
-@bot.callback_query_handler(func=lambda _: True)
-def on_callback(call: types.CallbackQuery):
-    uid = call.from_user.id
-    data = call.data or ""
-    bot.answer_callback_query(call.id, "Ок")
-    if data == "yes":
-        bot.send_message(uid, "Отлично, продолжаем!")
-    elif data == "no":
-        bot.send_message(uid, "Хорошо, давай уточним в чём сомнение.")
+    # Structural flow
+    if st["intent"] == INTENT_ERR:
+        handle_structural_flow(uid, text, st)
+        return
+
+    # Free flow — GPT
+    patterns = detect_trading_patterns(text)
+    suggest_analysis = should_suggest_deep_analysis(text, patterns)
+    
+    decision = gpt_decide(uid, text, st)
+    resp = decision.get("response_text", "Понял.")
+
+    # Update history (assistant)
+    history = st["data"].get("history", [])
+    if len(history) >= HIST_LIMIT:
+        history = history[-(HIST_LIMIT-1):]
+    history.append({"role": "assistant", "content": resp})
+
+    merged = st["data"].copy()
+    store = decision.get("store", {})
+    if isinstance(store, dict):
+        merged.update(store)
+    merged["history"] = history
+
+    new_intent = decision.get("intent", st["intent"])
+    new_step = decision.get("next_step", st["step"])
+
+    save_state(uid, intent=new_intent, step=new_step, data=merged)
+    
+    # Отправляем ответ
+    if original_message:
+        bot.reply_to(original_message, resp, reply_markup=MAIN_MENU)
+    else:
+        bot.send_message(uid, resp, reply_markup=MAIN_MENU)
+    
+    # Проактивное предложение помощи
+    if suggest_analysis and new_intent != INTENT_ERR:
+        bot.send_message(
+            uid, 
+            "Похоже, это системная проблема. Хочешь разберем её подробно? Это поможет найти корень и выработать решение.",
+            reply_markup=types.InlineKeyboardMarkup().row(
+                types.InlineKeyboardButton("Да, давай разберем", callback_data="deep_analysis_yes"),
+                types.InlineKeyboardButton("Пока нет", callback_data="deep_analysis_no")
+            )
+        )
+
+@bot.message_handler(content_types=['text'])
+def all_text(m: types.Message):
+    """Обработка текстовых сообщений"""
+    handle_text_message(m.from_user.id, m.text, m)
 
 # ========= Structural Flow =========
 def handle_structural_flow(uid: int, text_in: str, st: Dict[str, Any]):
@@ -410,66 +530,52 @@ def handle_structural_flow(uid: int, text_in: str, st: Dict[str, Any]):
         bot.send_message(uid, "\n".join(summary), reply_markup=MAIN_MENU)
         bot.send_message(uid, "Готов добавить это в фокус недели или идём дальше?")
 
-# ========= Main Text Handler =========
-@bot.message_handler(content_types=["text"])
-def all_text(m: types.Message):
-    try:
-        uid = m.from_user.id
-        text_in = (m.text or "").strip()
-        st = load_state(uid)
-        log.info("User %s: intent=%s step=%s text='%s'", uid, st["intent"], st["step"], text_in[:80])
+# ========= Callback =========
+@bot.callback_query_handler(func=lambda call: True)
+def on_callback(call: types.CallbackQuery):
+    uid = call.from_user.id
+    data = call.data or ""
+    bot.answer_callback_query(call.id, "Ок")
+    
+    if data == "deep_analysis_yes":
+        save_state(uid, intent=INTENT_ERR, step=STEP_ERR_DESCR)
+        bot.send_message(uid, "Отлично! Коротко опиши текущую ошибку (1–2 предложения).")
+    elif data == "deep_analysis_no":
+        bot.send_message(uid, "Хорошо, как скажешь. Если передумаешь — просто напиши об этом.", reply_markup=MAIN_MENU)
 
-        # Update history (user)
-        history = st["data"].get("history", [])
-        if len(history) >= HIST_LIMIT:
-            history = history[-(HIST_LIMIT-1):]
-        history.append({"role": "user", "content": text_in})
-        st["data"]["history"] = history
+# ========= Menu Handlers =========
+MENU_BTNS = {
+    "🚑 У меня ошибка": "error",
+    "🧩 Хочу стратегию": "strategy",
+    "📄 Паспорт": "passport",
+    "🗒 Панель недели": "weekpanel",
+    "🆘 Экстренно": "panic",
+    "🤔 Не знаю, с чего начать": "start_help",
+}
 
-        # Greeting: style selection
-        if st["intent"] == INTENT_GREET and st["step"] == STEP_ASK_STYLE:
-            if text_in.lower() in ("ты", "вы"):
-                st["data"]["style"] = text_in.lower()
-                save_state(uid, intent=INTENT_FREE, step=STEP_FREE_INTRO, data=st["data"])
-                bot.send_message(uid, f"Принято ({text_in}). Расскажи, что сейчас болит в торговле.", reply_markup=MAIN_MENU)
-            else:
-                save_state(uid, data=st["data"])
-                bot.send_message(uid, "Пожалуйста, выбери «ты» или «вы».", reply_markup=style_kb())
-            return
+@bot.message_handler(func=lambda m: m.text in MENU_BTNS.keys())
+def handle_menu(m: types.Message):
+    uid = m.from_user.id
+    st = load_state(uid)
+    label = m.text
+    code = MENU_BTNS[label]
 
-        # Structural flow
-        if st["intent"] == INTENT_ERR:
-            handle_structural_flow(uid, text_in, st)
-            return
+    # history
+    history = st["data"].get("history", [])
+    if len(history) >= HIST_LIMIT:
+        history = history[-(HIST_LIMIT-1):]
+    history.append({"role": "user", "content": label})
+    st["data"]["history"] = history
 
-        # Free flow — GPT
-        decision = gpt_decide(uid, text_in, st)
-        resp = decision.get("response_text", "Понял.")
-
-        # Update history (assistant)
-        history = st["data"].get("history", [])
-        if len(history) >= HIST_LIMIT:
-            history = history[-(HIST_LIMIT-1):]
-        history.append({"role": "assistant", "content": resp})
-
-        merged = st["data"].copy()
-        store = decision.get("store", {})
-        if isinstance(store, dict):
-            merged.update(store)
-        merged["history"] = history
-
-        new_intent = decision.get("intent", st["intent"])
-        new_step = decision.get("next_step", st["step"])
-
-        save_state(uid, intent=new_intent, step=new_step, data=merged)
-        bot.send_message(uid, resp, reply_markup=MAIN_MENU)
-
-    except Exception as e:
-        log.error("Text handler error: %s", e)
-        try:
-            bot.send_message(m.chat.id, "Произошла ошибка. Попробуй ещё раз или используй /reset для сброса.")
-        except:
-            pass
+    if code == "error":
+        save_state(uid, intent=INTENT_ERR, step=STEP_ERR_DESCR, data=st["data"])
+        bot.send_message(uid, "Коротко опиши текущую ошибку (1–2 предложения). Если уже формулировали выше — можно кратко.")
+    elif code == "start_help":
+        bot.send_message(uid, "Предлагаю так: 1) Паспорт, 2) Фокус недели, 3) Скелет ТС. С чего начнём?", reply_markup=MAIN_MENU)
+        save_state(uid, data=st["data"])
+    else:
+        bot.send_message(uid, "Окей. Если хочешь ускориться — начнём с разбора ошибки.", reply_markup=MAIN_MENU)
+        save_state(uid, data=st["data"])
 
 # ========= Webhook / Health =========
 @app.get("/")
@@ -482,7 +588,7 @@ def health():
 
 @app.get("/status")
 def status():
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat(), "version": "2025-08-30-prod"})
+    return jsonify({"ok": True, "time": datetime.utcnow().isoformat(), "version": "2025-09-01-mentor-v2"})
 
 @app.post(f"/{WEBHOOK_PATH}")
 def webhook():
