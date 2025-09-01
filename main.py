@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-05-v1
+# Версия: 2025-09-05-v2
 
 import os
 import json
@@ -358,6 +358,8 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         10. После выявления проблемы предлагай её разбор через подтверждение
         11. Избегай общих фраз и советов
         12. Фокусируйся на конкретных действиях и решениях
+        13. Не задавай вопросы по кругу
+        14. Не спрашивай "как долго" или "в каких ситуациях"
         
         Ответ отдавай строкой JSON с ключами: next_step, intent, response_text, store(объект), is_structural(true/false).
         """
