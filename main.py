@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-05-v3
+# Версия: 2025-09-05-v4
 
 import os
 import json
@@ -260,7 +260,8 @@ def remove_template_phrases(text: str) -> str:
         "Сложности с", "Давай разберем", "Это распространённая проблема",
         "Можешь рассказать", "Как ты обычно", "Что именно вызывает",
         "Какие конкретно", "Как долго", "В каких ситуациях", "Понимаю, как",
-        "Скажи,", "Расскажи,", "Важно", "Обычно", "Часто"
+        "Скажи,", "Расскажи,", "Важно", "Обычно", "Часто", "Это поможет",
+        "Давай рассмотрим", "Можешь описать", "Было бы полезно"
     ]
     
     for phrase in template_phrases:
@@ -376,6 +377,9 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         12. Фокусируйся на конкретных действиях и решениях
         13. Не задавай вопросы по кругу
         14. Не спрашивай "как долго" или "в каких ситуациях"
+        15. НИКОГДА не используй фразы типа "это поможет", "давай рассмотрим", "было бы полезно"
+        16. Всегда давай прямой, конкретный ответ на вопрос пользователя
+        17. Если пользователь описывает проблему - сразу предлагай решение или уточняющий вопрос
         
         Ответ отдавай строкой JSON с ключами: next_step, intent, response_text, store(объект), is_structural(true/false).
         """
@@ -389,7 +393,7 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         res = oai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs,
-            temperature=0.1,
+            temperature=0.3,  # Повысим температуру для более креативных ответов
             response_format={"type": "json_object"},
         )
         raw = res.choices[0].message.content or "{}"
@@ -406,6 +410,22 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         dec["response_text"] = anti_echo(text_in, dec["response_text"])
         # Очищаем от шаблонных фраз
         dec["response_text"] = remove_template_phrases(dec["response_text"])
+        
+        # Проверяем, не является ли ответ слишком общим
+        if len(dec["response_text"]) < 20 or any(phrase in dec["response_text"].lower() for phrase in ["поможет", "рассмотрим", "полезно"]):
+            log.warning("Response is too generic, trying again with different temperature")
+            # Пробуем с другой температурой
+            res = oai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=msgs,
+                temperature=0.7,  # Высокая температура для разнообразия
+                response_format={"type": "json_object"},
+            )
+            raw = res.choices[0].message.content or "{}"
+            dec = json.loads(raw)
+            dec["response_text"] = anti_echo(text_in, dec.get("response_text", "Понял. Продолжим."))
+            dec["response_text"] = remove_template_phrases(dec["response_text"])
+            
         return dec
 
     except Exception as e:
@@ -775,7 +795,7 @@ def cleanup_old_states(days: int = 30):
 def cleanup_scheduler():
     """Runs cleanup daily"""
     while True:
-        time.sleep(24 * 60 * 60)  # 24 hours
+        time.sleep(24 * 60 * 60) # 24 hours
         cleanup_old_states(30)
 
 if __name__ == "__main__":
