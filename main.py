@@ -1,15 +1,15 @@
-# main.py — Innertrade Kai Mentor Bot (Production Ready)
-# Версия: 2025-09-04-mentor-v5
+# main.py — Innertrade Kai Mentor Bot
+# Версия: 2025-09-05-v1
 
 import os
 import json
 import time
 import logging
 import threading
+import hashlib
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List, Tuple
-from difflib import SequenceMatcher
+from typing import Any, Dict, Optional, List
 
 import requests
 from flask import Flask, request, abort, jsonify
@@ -18,6 +18,18 @@ from sqlalchemy.pool import QueuePool
 import telebot
 from telebot import types
 from openai import OpenAI
+
+# ========= Version Check =========
+def get_code_version():
+    """Возвращает хэш текущей версии кода для проверки"""
+    try:
+        with open(__file__, 'rb') as f:
+            content = f.read()
+            return hashlib.md5(content).hexdigest()[:8]
+    except:
+        return "unknown"
+
+BOT_VERSION = f"2025-09-05-{get_code_version()}"
 
 # ========= ENV =========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -48,6 +60,7 @@ if not TG_SECRET:
 # Logging
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("innertrade")
+log.info(f"Starting bot version: {BOT_VERSION}")
 
 # ========= INTENTS/STEPS =========
 INTENT_GREET = "greet"
@@ -358,7 +371,7 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         res = oai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs,
-            temperature=0.1,  # Пониженная температура для более предсказуемых ответов
+            temperature=0.1,
             response_format={"type": "json_object"},
         )
         raw = res.choices[0].message.content or "{}"
@@ -385,6 +398,16 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
 @bot.message_handler(commands=["ping"])
 def cmd_ping(m: types.Message):
     bot.reply_to(m, "pong")
+
+@bot.message_handler(commands=["version", "v"])
+def cmd_version(m: types.Message):
+    """Показывает текущую версию бота"""
+    version_info = f"""
+🔄 Версия бота: {BOT_VERSION}
+📝 Хэш кода: {get_code_version()}
+🕒 Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    bot.reply_to(m, version_info)
 
 @bot.message_handler(commands=["status"])
 def cmd_status(m: types.Message):
@@ -655,9 +678,19 @@ def root():
 def health():
     return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
 
+@app.get("/version")
+def version_api():
+    """API endpoint для проверки версии"""
+    return jsonify({
+        "version": BOT_VERSION,
+        "code_hash": get_code_version(),
+        "status": "running",
+        "timestamp": datetime.now().isoformat()
+    })
+
 @app.get("/status")
 def status():
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat(), "version": "2025-09-04-mentor-v5"})
+    return jsonify({"ok": True, "time": datetime.utcnow().isoformat(), "version": BOT_VERSION})
 
 @app.post(f"/{WEBHOOK_PATH}")
 def webhook():
