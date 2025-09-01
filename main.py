@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-05-v2
+# Версия: 2025-09-05-v3
 
 import os
 import json
@@ -10,6 +10,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
+from difflib import SequenceMatcher
 
 import requests
 from flask import Flask, request, abort, jsonify
@@ -85,13 +86,26 @@ MER_ORDER = [STEP_MER_CTX, STEP_MER_EMO, STEP_MER_THO, STEP_MER_BEH]
 
 # ========= OpenAI =========
 oai_client = None
+openai_status = "disabled"
+
 if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
     try:
         oai_client = OpenAI(api_key=OPENAI_API_KEY)
-        log.info("OpenAI client initialized")
+        # Test the API with a simple request
+        test_response = oai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=5
+        )
+        openai_status = "active"
+        log.info("OpenAI client initialized successfully")
     except Exception as e:
-        log.error("OpenAI init error: %s", e)
+        log.error(f"OpenAI init error: {e}")
         oai_client = None
+        openai_status = f"error: {str(e)}"
+else:
+    log.warning("OpenAI disabled - missing API key or OFFSCRIPT_ENABLED=false")
+    openai_status = "disabled"
 
 # ========= DB =========
 engine = create_engine(
@@ -328,7 +342,9 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         "store": {},
         "is_structural": False
     }
+    
     if not oai_client or not OFFSCRIPT_ENABLED:
+        log.warning(f"OpenAI not available: oai_client={oai_client}, OFFSCRIPT_ENABLED={OFFSCRIPT_ENABLED}")
         return fallback
 
     try:
@@ -408,8 +424,21 @@ def cmd_version(m: types.Message):
 🔄 Версия бота: {BOT_VERSION}
 📝 Хэш кода: {get_code_version()}
 🕒 Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+🤖 OpenAI статус: {openai_status}
 """
     bot.reply_to(m, version_info)
+
+@bot.message_handler(commands=["debug"])
+def cmd_debug(m: types.Message):
+    """Показывает отладочную информацию"""
+    debug_info = {
+        "openai_available": bool(oai_client),
+        "offscript_enabled": OFFSCRIPT_ENABLED,
+        "has_api_key": bool(OPENAI_API_KEY),
+        "model": OPENAI_MODEL,
+        "openai_status": openai_status
+    }
+    bot.reply_to(m, f"<code>{json.dumps(debug_info, ensure_ascii=False, indent=2)}</code>")
 
 @bot.message_handler(commands=["status"])
 def cmd_status(m: types.Message):
