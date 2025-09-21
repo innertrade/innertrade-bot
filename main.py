@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22-v5
+# Версия: 2025-09-22-v6
 
 import os
 import json
@@ -221,7 +221,7 @@ def detect_trading_patterns(text: str) -> List[str]:
     patterns = {
         "remove_stop": ["убираю стоп", "убрал стоп", "убрала стоп", "убираю стоп-лосс", "снимаю стоп"],
         "move_stop": ["двигаю стоп", "переставляю стоп", "передвигаю стоп", "отодвигал стоп", "перенёс стоп"],
-        "early_close": ["раньше времени закрыл", "закрыл рано", "выход раньше", "зафиксировал рано", "маленький плюс закрыл"],
+        "early_close": ["раньше времени закрыл", "закрыл рано", "выход раньше", "зафиксировал рано", "маленький плюс закрыл", "мизерный плюс"],
         "averaging": ["усреднение", "усреднял", "добавлялся", "докупал против", "доливался"],
         "break_even": ["в безубыток", "перевёл в ноль", "перевод в безубыток"],
         "small_profit": ["мелкий профит", "мизерный плюс", "скоро фиксирую"],
@@ -770,14 +770,17 @@ def cleanup_scheduler():
         time.sleep(24 * 60 * 60)  # 24h
         cleanup_old_states(30)
 
-# Запуск инициализации при первом запросе (под gunicorn)
+# ========= Boot under Flask 3.x (no before_first_request) =========
 _boot_done = False
-@app.before_first_request
-def boot():
+
+@app.before_request
+def _lazy_boot_once():
+    """Фласк 3.x: инициализируем на первом запросе безопасно один раз"""
     global _boot_done
     if _boot_done:
         return
     _boot_done = True
+
     init_db(silent=False)
 
     # старт фонового клинера
@@ -790,7 +793,7 @@ def boot():
     if SET_WEBHOOK_FLAG:
         setup_webhook()
 
-# Локальный запуск (dev). На Render используем gunicorn командой:
+# Локальный запуск (dev). На Render используем gunicorn:
 # gunicorn -w 1 -b 0.0.0.0:$PORT main:app
 if __name__ == "__main__":
     # Dev-режим: поднимаем всё сами
