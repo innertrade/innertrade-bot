@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22 (coach-struct v7-final)
+# Версия: 2025-09-22 (coach-struct v8-final)
 
 import os
 import json
@@ -15,9 +15,10 @@ from functools import lru_cache
 
 from flask import Flask, request, abort, jsonify
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
 import telebot
 from telebot import types
-import openai
+from openai import OpenAI  # ← Новый импорт
 
 # ========= Version =========
 def get_code_version():
@@ -78,10 +79,13 @@ MER_ORDER = [STEP_MER_CTX, STEP_MER_EMO, STEP_MER_THO, STEP_MER_BEH]
 
 # ========= OpenAI =========
 openai_status = "disabled"
+openai_client = None
+
 if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
     try:
-        openai.api_key = OPENAI_API_KEY
-        test_response = openai.ChatCompletion.create(
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        # Тестовый запрос для проверки подключения
+        test_response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": "test"}],
             max_tokens=5
@@ -93,13 +97,13 @@ if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
         openai_status = f"error: {e}"
 
 # ========= DB =========
-# Простой engine без дополнительных параметров
+# Используем правильный формат URL для SQLAlchemy 2.0
 db_url = DATABASE_URL
 if db_url and db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
     log.info("Fixed database URL format")
 
-engine = create_engine(db_url)  # ← Только URL, без параметров пула
+engine = create_engine(db_url)
 
 def db_exec(sql: str, params: Optional[Dict[str, Any]] = None):
     with engine.begin() as conn:
@@ -266,17 +270,17 @@ def extract_problem_summary(history: List[Dict]) -> str:
 
 # ========= Voice (Whisper) =========
 def transcribe_voice(audio_file_path: str) -> Optional[str]:
-    if not OPENAI_API_KEY:
+    if not openai_client:
         log.warning("Whisper: API key not available")
         return None
     try:
         with open(audio_file_path, "rb") as audio_file:
-            tr = openai.Audio.transcribe(
+            tr = openai_client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
                 language="ru"
             )
-        return tr.get("text", None) if tr else None
+        return tr.text if tr else None
     except Exception as e:
         log.error("Whisper error: %s", e)
         return None
@@ -291,7 +295,7 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         "is_structural": False
     }
     
-    if not OPENAI_API_KEY or not OFFSCRIPT_ENABLED:
+    if not openai_client or not OFFSCRIPT_ENABLED:
         log.warning("OpenAI not available")
         return fallback
 
@@ -320,13 +324,13 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
     msgs.append({"role": "user", "content": text_in})
 
     try:
-        res = openai.ChatCompletion.create(
+        res = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs,
             temperature=0.3,
         )
         
-        raw = res["choices"][0]["message"]["content"] if res.get("choices") else "{}"
+        raw = res.choices[0].message.content if res.choices else "{}"
         dec = json.loads(raw)
         
         if not isinstance(dec, dict):
