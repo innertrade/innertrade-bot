@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22 (coach-struct v6-fixed-db)
+# Версия: 2025-09-22 (coach-struct v7-final)
 
 import os
 import json
@@ -15,7 +15,6 @@ from functools import lru_cache
 
 from flask import Flask, request, abort, jsonify
 from sqlalchemy import create_engine, text
-from sqlalchemy.pool import QueuePool
 import telebot
 from telebot import types
 import openai
@@ -94,20 +93,13 @@ if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
         openai_status = f"error: {e}"
 
 # ========= DB =========
-# Исправляем URL для совместимости с SQLAlchemy 1.4
+# Простой engine без дополнительных параметров
 db_url = DATABASE_URL
 if db_url and db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
     log.info("Fixed database URL format")
 
-engine = create_engine(
-    db_url,
-    poolclass=QueuePool,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
-    pool_recycle=1800,
-)
+engine = create_engine(db_url)  # ← Только URL, без параметров пула
 
 def db_exec(sql: str, params: Optional[Dict[str, Any]] = None):
     with engine.begin() as conn:
