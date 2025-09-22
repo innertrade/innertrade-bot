@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22 (coach-struct v4-fixed)
+# Версия: 2025-09-22 (coach-struct v5-openai-0.28.1)
 
 import os
 import json
@@ -18,7 +18,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 import telebot
 from telebot import types
-from openai import OpenAI
+import openai  # ← ИЗМЕНЕНО: импорт без OpenAI класса
 
 # ========= Version =========
 def get_code_version():
@@ -45,9 +45,9 @@ MAX_BODY = int(os.getenv("MAX_BODY", "1000000"))
 HIST_LIMIT = 12
 
 # Поведение сессии / напоминаний
-RESUME_THRESHOLD_MIN = int(os.getenv("RESUME_THRESHOLD_MIN", "60"))       # если прошло > N мин молчания — при следующем сообщении спросим «продолжим?»
-REMIND_AFTER_MIN = int(os.getenv("REMIND_AFTER_MIN", "5"))                # тихий пинг если молчат N минут после вопроса
-REMIND_REPEAT_MIN = int(os.getenv("REMIND_REPEAT_MIN", "60"))             # не пинговать чаще чем раз в N минут
+RESUME_THRESHOLD_MIN = int(os.getenv("RESUME_THRESHOLD_MIN", "60"))
+REMIND_AFTER_MIN = int(os.getenv("REMIND_AFTER_MIN", "5"))
+REMIND_REPEAT_MIN = int(os.getenv("REMIND_REPEAT_MIN", "60"))
 
 if not TELEGRAM_TOKEN or not DATABASE_URL or not PUBLIC_URL or not TG_SECRET:
     raise RuntimeError("ENV variables missing")
@@ -64,15 +64,12 @@ INTENT_ERR = "error"
 
 STEP_ASK_STYLE = "ask_style"
 STEP_FREE_INTRO = "free_intro"
-
-STEP_ERR_CONFIRM = "err_confirm"   # новое: подтверждение формулировки проблемы перед разбором
+STEP_ERR_CONFIRM = "err_confirm"
 STEP_ERR_DESCR = "err_describe"
-
 STEP_MER_CTX = "mer_context"
 STEP_MER_EMO = "mer_emotions"
 STEP_MER_THO = "mer_thoughts"
 STEP_MER_BEH = "mer_behavior"
-
 STEP_GOAL = "goal_positive"
 STEP_TOTE_OPS = "tote_ops"
 STEP_TOTE_TEST = "tote_test"
@@ -81,12 +78,13 @@ STEP_TOTE_EXIT = "tote_exit"
 MER_ORDER = [STEP_MER_CTX, STEP_MER_EMO, STEP_MER_THO, STEP_MER_BEH]
 
 # ========= OpenAI =========
-oai_client = None
 openai_status = "disabled"
 if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
     try:
-        oai_client = OpenAI(api_key=OPENAI_API_KEY)
-        oai_client.chat.completions.create(
+        # ИСПРАВЛЕНО: старый стиль инициализации
+        openai.api_key = OPENAI_API_KEY
+        # ИСПРАВЛЕНО: старый стиль вызова
+        test_response = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": "test"}],
             max_tokens=5
@@ -95,7 +93,6 @@ if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
         log.info("OpenAI ready")
     except Exception as e:
         log.error(f"OpenAI init error: {e}")
-        oai_client = None
         openai_status = f"error: {e}"
 
 # ========= DB =========
@@ -139,7 +136,6 @@ def load_state(uid: int) -> Dict[str, Any]:
                 data = {}
         return {"user_id": uid, "intent": row["intent"] or INTENT_GREET,
                 "step": row["step"] or STEP_ASK_STYLE, "data": data}
-    # дефолтные поля для менеджмента сессии
     return {"user_id": uid, "intent": INTENT_GREET, "step": STEP_ASK_STYLE,
             "data": {"history": [], "last_activity_at": _now_iso(), "awaiting_reply": False}}
 
@@ -150,7 +146,6 @@ def save_state(uid: int, intent=None, step=None, data=None) -> Dict[str, Any]:
     new_data = cur["data"].copy()
     if data:
         new_data.update(data)
-    # авто-метки времени
     new_data["last_activity_at"] = _now_iso()
     db_exec("""
         INSERT INTO user_state (user_id, intent, step, data, updated_at)
@@ -201,7 +196,6 @@ EMO_PATTERNS = {
 
 @lru_cache(maxsize=1000)
 def detect_trading_patterns_cached(text: str) -> List[str]:
-    """Кэшированная версия детекции паттернов"""
     tl = (text or "").lower()
     hits = []
     for name, keys in {**RISK_PATTERNS, **EMO_PATTERNS}.items():
@@ -248,7 +242,6 @@ def _iso_to_dt(s: Optional[str]) -> Optional[datetime]:
         return None
 
 def mer_prompt_for(step: str) -> str:
-    # мягкие формулировки
     return {
         STEP_MER_CTX: "Зафиксируем контекст: где и когда это было? Пару слов.",
         STEP_MER_EMO: "Чтобы мне точнее подстроиться: какие чувства всплыли в тот момент? 2–3 слова.",
@@ -273,24 +266,24 @@ def extract_problem_summary(history: List[Dict]) -> str:
 
 # ========= Voice (Whisper) =========
 def transcribe_voice(audio_file_path: str) -> Optional[str]:
-    if not oai_client:
-        log.warning("Whisper: client not available")
+    if not OPENAI_API_KEY:
+        log.warning("Whisper: API key not available")
         return None
     try:
         with open(audio_file_path, "rb") as audio_file:
-            tr = oai_client.audio.transcriptions.create(
+            # ИСПРАВЛЕНО: старый стиль транскрибации
+            tr = openai.Audio.transcribe(
                 model="whisper-1",
                 file=audio_file,
                 language="ru"
             )
-        return getattr(tr, "text", None)
+        return tr.get("text", None) if tr else None
     except Exception as e:
         log.error("Whisper error: %s", e)
         return None
 
 # ========= GPT (strict coach) =========
 def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
-    """Один точный вопрос/мостик. Без советов и списков техник."""
     fallback = {
         "next_step": st["step"],
         "intent": st["intent"],
@@ -299,7 +292,7 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         "is_structural": False
     }
     
-    if not oai_client or not OFFSCRIPT_ENABLED:
+    if not OPENAI_API_KEY or not OFFSCRIPT_ENABLED:
         log.warning("OpenAI not available")
         return fallback
 
@@ -328,14 +321,17 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
     msgs.append({"role": "user", "content": text_in})
 
     try:
-        res = oai_client.chat.completions.create(
+        # ИСПРАВЛЕНО: старый стиль вызова
+        res = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=msgs,
             temperature=0.3,
-            response_format={"type": "json_object"},
         )
-        raw = res.choices[0].message.content or "{}"
+        
+        # ИСПРАВЛЕНО: обработка старого формата ответа
+        raw = res["choices"][0]["message"]["content"] if res.get("choices") else "{}"
         dec = json.loads(raw)
+        
         if not isinstance(dec, dict):
             return fallback
         for k in ["next_step", "intent", "response_text", "store", "is_structural"]:
@@ -353,13 +349,11 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         return dec
     except Exception as e:
         log.error("GPT decision error: %s", e)
-        # Возвращаем понятное сообщение об ошибке пользователю
         fallback["response_text"] = "Извини, произошла техническая ошибка при обработке запроса. Попробуй переформулировать вопрос или повторить позже."
         return fallback
 
 # ========= High-level UX helpers =========
 def offer_structural(uid: int, st: Dict[str, Any]):
-    """Предложить перейти к структурному разбору (без названий техник)."""
     if st["data"].get("struct_offer_shown"):
         return
     st["data"]["struct_offer_shown"] = True
@@ -378,12 +372,10 @@ def set_awaiting(uid: int, st: Dict[str, Any], awaiting: bool):
     save_state(uid, data=st["data"])
 
 def greet_or_resume(uid: int, st: Dict[str, Any], text_in: str) -> bool:
-    """Если приветствие/долгая пауза — спросить «продолжаем?»; возвращает True если отправили резюм-карточку."""
     tl = (text_in or "").strip().lower()
     is_greeting = tl in ("привет", "hi", "hello", "здравствуй", "добрый день", "добрый вечер", "йо", "ку", "хай") or \
                   tl.startswith("привет ")
     
-    # если «новый разбор» — мгновенно в чистый разбор
     if any(key in tl for key in ["новый разбор", "с нуля", "начать заново", "start over"]):
         st["data"].pop("mer", None)
         st["data"].pop("tote", None)
@@ -394,10 +386,8 @@ def greet_or_resume(uid: int, st: Dict[str, Any], text_in: str) -> bool:
         set_awaiting(uid, st, True)
         return True
 
-    # если было молчание дольше порога — мягко уточнить
     last = _iso_to_dt(st["data"].get("last_activity_at"))
     if is_greeting or (last and datetime.now(timezone.utc) - last > timedelta(minutes=RESUME_THRESHOLD_MIN)):
-        # если есть незавершённый разбор — спросим
         if st["intent"] == INTENT_ERR and st["step"] not in (STEP_FREE_INTRO, STEP_ASK_STYLE):
             bot.send_message(uid, "Привет! Похоже, мы не завершили прошлый разбор. Продолжим или начнём заново?", reply_markup=RESUME_KB)
             set_awaiting(uid, st, False)
@@ -459,18 +449,15 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
     st = load_state(uid)
     log.info("User %s: intent=%s step=%s text='%s'", uid, st["intent"], st["step"], text_in[:200])
 
-    # history (user)
     history = st["data"].get("history", [])
     if len(history) >= HIST_LIMIT:
         history = history[-(HIST_LIMIT-1):]
     history.append({"role": "user", "content": text_in})
     st["data"]["history"] = history
 
-    # приветствие/резюм - ВАЖНО: если вернули True, выходим из функции
     if greet_or_resume(uid, st, text_in):
-        return  # ← КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: выходим если обработали приветствие
+        return
 
-    # выбор стиля
     if st["intent"] == INTENT_GREET and st["step"] == STEP_ASK_STYLE:
         if text_in.lower() in ("ты", "вы"):
             st["data"]["style"] = text_in.lower()
@@ -485,7 +472,6 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
             bot.send_message(uid, "Выбери «ты» или «вы».", reply_markup=STYLE_KB)
         return
 
-    # явный запрос «новый разбор» - ВАЖНО: добавляем return после обработки
     tl = text_in.lower()
     if any(key in tl for key in ["новый разбор", "с нуля", "начать заново", "start over"]):
         st["data"].pop("mer", None)
@@ -495,18 +481,15 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
         save_state(uid, INTENT_ERR, STEP_ERR_DESCR, st["data"])
         bot.send_message(uid, "Окей, начнём заново. Опиши последний случай: что планировал и где отступил?")
         set_awaiting(uid, st, True)
-        return  # ← КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: выходим после обработки
+        return
 
-    # меню/интенты
     if st["intent"] == INTENT_ERR:
         handle_structural(uid, text_in, st)
         return
 
-    # свободный коуч-поток
     decision = gpt_decide(uid, text_in, st)
     resp = decision.get("response_text") or "Окей. На этом кейсе: где именно ты отступил от плана (вход/стоп/выход)?"
 
-    # history (assistant)
     history = st["data"].get("history", [])
     if len(history) >= HIST_LIMIT:
         history = history[-(HIST_LIMIT-1):]
@@ -527,36 +510,29 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
     else:
         bot.send_message(uid, resp, reply_markup=MAIN_MENU)
 
-    # отметим «ждём ответ»
     set_awaiting(uid, st_after, True)
 
-    # предложение «пойти по шагам»
     if decision.get("is_structural", False) or should_force_structural(text_in):
         offer_structural(uid, st_after)
 
 # ========= Structural Flow =========
 def handle_structural(uid: int, text_in: str, st: Dict[str, Any]):
-    # если ещё не подтверждена проблема — попросим согласовать формулировку
     if st["step"] == STEP_FREE_INTRO or st["step"] == STEP_ERR_CONFIRM:
-        # возьмём короткое резюме из последних сообщений
         summary = extract_problem_summary(st["data"].get("history", []))
         bot.send_message(uid, f"Зафиксирую проблему, чтобы мы говорили об одном и том же:\n\n<b>{summary}</b>\n\nВерно сформулировал?", reply_markup=CONFIRM_KB)
         save_state(uid, INTENT_ERR, STEP_ERR_CONFIRM, st["data"])
         set_awaiting(uid, st, True)
         return
 
-    # a) описание ошибки (ввод)
     if st["step"] == STEP_ERR_DESCR:
         new_data = st["data"].copy()
         new_data["error_description"] = text_in
-        # мягкий мостик к шагам
         bot.send_message(uid, "Окей, двигаемся короткими шагами — я рядом, темп задаёшь ты.")
         save_state(uid, INTENT_ERR, STEP_MER_CTX, new_data)
         bot.send_message(uid, mer_prompt_for(STEP_MER_CTX))
         set_awaiting(uid, st, True)
         return
 
-    # b) шаги (без названий техник)
     if st["step"] in MER_ORDER:
         mer = st["data"].get("mer", {})
         mer[st["step"]] = text_in
@@ -567,11 +543,9 @@ def handle_structural(uid: int, text_in: str, st: Dict[str, Any]):
         if idx + 1 < len(MER_ORDER):
             nxt = MER_ORDER[idx + 1]
             save_state(uid, INTENT_ERR, nxt, new_data)
-            # короткий мостик между вопросами
             bot.send_message(uid, "Принял. Следующий маленький штрих.")
             bot.send_message(uid, mer_prompt_for(nxt))
         else:
-            # мини-фиксация «итога части»
             m = new_data.get("mer", {})
             bot.send_message(uid,
                 "Собрали картинку: контекст, эмоции, мысли и действия. Теперь — куда хочешь прийти вместо прежней реакции.")
@@ -580,7 +554,6 @@ def handle_structural(uid: int, text_in: str, st: Dict[str, Any]):
         set_awaiting(uid, st, True)
         return
 
-    # c) Goal
     if st["step"] == STEP_GOAL:
         new_data = st["data"].copy()
         new_data["goal"] = text_in
@@ -590,7 +563,6 @@ def handle_structural(uid: int, text_in: str, st: Dict[str, Any]):
         set_awaiting(uid, st, True)
         return
 
-    # d) Проверка
     if st["step"] == STEP_TOTE_OPS:
         tote = st["data"].get("tote", {})
         tote["ops"] = text_in
@@ -601,7 +573,6 @@ def handle_structural(uid: int, text_in: str, st: Dict[str, Any]):
         set_awaiting(uid, st, True)
         return
 
-    # e) Что делаем, если «не получилось»
     if st["step"] == STEP_TOTE_TEST:
         tote = st["data"].get("tote", {})
         tote["test"] = text_in
@@ -612,7 +583,6 @@ def handle_structural(uid: int, text_in: str, st: Dict[str, Any]):
         set_awaiting(uid, st, True)
         return
 
-    # f) Итог
     if st["step"] == STEP_TOTE_EXIT:
         tote = st["data"].get("tote", {})
         tote["exit"] = text_in
@@ -663,7 +633,6 @@ def handle_menu(m: types.Message):
     if code == "error":
         st["data"]["problem_confirmed"] = False
         save_state(uid, INTENT_ERR, STEP_ERR_CONFIRM, st["data"])
-        # Сразу попросим подтвердить формулировку по истории
         summary = extract_problem_summary(st["data"].get("history", []))
         bot.send_message(uid, f"Хочу убедиться, что верно понял:\n\n<b>{summary}</b>\n\nПодходит такая формулировка?", reply_markup=CONFIRM_KB)
         set_awaiting(uid, st, True)
@@ -707,10 +676,8 @@ def on_callback(call: types.CallbackQuery):
         set_awaiting(uid, st, True)
 
     elif data == "resume_flow":
-        # просто продолжаем с текущего шага
         bot.send_message(uid, "Продолжаем с того места, где остановились.")
         step = st["step"]
-        # подсказка исходя из шага
         if step in MER_ORDER:
             bot.send_message(uid, mer_prompt_for(step))
         elif step == STEP_ERR_DESCR:
@@ -766,7 +733,6 @@ def webhook():
 # ========= Maintenance & gentle reminders =========
 def cleanup_old_states(days: int = 30):
     try:
-        # ИСПРАВЛЕННЫЙ ЗАПРОС - убрал make_interval
         result = db_exec(
             "DELETE FROM user_state WHERE updated_at < NOW() - INTERVAL '1 day' * :days", 
             {"days": days}
@@ -776,10 +742,8 @@ def cleanup_old_states(days: int = 30):
         log.error("Cleanup error: %s", e)
 
 def reminder_tick():
-    """Каждую минуту: если ждём ответ и тишина > REMIND_AFTER_MIN — мягкий пинг (не чаще REMIND_REPEAT_MIN)."""
     while True:
         try:
-            # ИСПРАВЛЕННЫЙ ЗАПРОС - убрал make_interval, добавил безопасный LIKE
             rows = db_exec("""
                 SELECT user_id, intent, step, data
                 FROM user_state
@@ -803,7 +767,6 @@ def reminder_tick():
                 if last_ping and (now - last_ping) < timedelta(minutes=REMIND_REPEAT_MIN):
                     continue
                     
-                # отправим мягкий пинг
                 try:
                     bot.send_message(r["user_id"], "Как будешь готов — продолжим. Могу повторить вопрос.")
                     data["reminder_sent_at"] = _now_iso()
@@ -821,7 +784,7 @@ def reminder_tick():
 
 def cleanup_scheduler():
     while True:
-        time.sleep(24 * 60 * 60)  # 24 hours
+        time.sleep(24 * 60 * 60)
         cleanup_old_states(30)
 
 # ========= Init on import (for gunicorn) =========
