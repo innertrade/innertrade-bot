@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22 (coach-struct v3-resume+tone)
+# Версия: 2025-09-22 (coach-struct v4-fixed)
 
 import os
 import json
@@ -11,6 +11,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List
 from difflib import SequenceMatcher
+from functools import lru_cache
 
 from flask import Flask, request, abort, jsonify
 from sqlalchemy import create_engine, text
@@ -198,13 +199,18 @@ EMO_PATTERNS = {
     "chaos": ["хаос", "суета", "путаюсь"],
 }
 
-def detect_trading_patterns(text: str) -> List[str]:
+@lru_cache(maxsize=1000)
+def detect_trading_patterns_cached(text: str) -> List[str]:
+    """Кэшированная версия детекции паттернов"""
     tl = (text or "").lower()
     hits = []
     for name, keys in {**RISK_PATTERNS, **EMO_PATTERNS}.items():
         if any(k in tl for k in keys):
             hits.append(name)
     return hits
+
+def detect_trading_patterns(text: str) -> List[str]:
+    return detect_trading_patterns_cached(text)
 
 def should_force_structural(text: str) -> bool:
     pats = detect_trading_patterns(text)
@@ -288,11 +294,13 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
     fallback = {
         "next_step": st["step"],
         "intent": st["intent"],
-        "response_text": "Возьмём этот кейс. Где именно ты отступил от плана (вход/стоп/выход)?",
+        "response_text": "Извини, произошла техническая ошибка. Попробуй переформулировать вопрос.",
         "store": {},
         "is_structural": False
     }
+    
     if not oai_client or not OFFSCRIPT_ENABLED:
+        log.warning("OpenAI not available")
         return fallback
 
     style = st["data"].get("style", "ты")
@@ -345,6 +353,8 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         return dec
     except Exception as e:
         log.error("GPT decision error: %s", e)
+        # Возвращаем понятное сообщение об ошибке пользователю
+        fallback["response_text"] = "Извини, произошла техническая ошибка при обработке запроса. Попробуй переформулировать вопрос или повторить позже."
         return fallback
 
 # ========= High-level UX helpers =========
@@ -372,6 +382,7 @@ def greet_or_resume(uid: int, st: Dict[str, Any], text_in: str) -> bool:
     tl = (text_in or "").strip().lower()
     is_greeting = tl in ("привет", "hi", "hello", "здравствуй", "добрый день", "добрый вечер", "йо", "ку", "хай") or \
                   tl.startswith("привет ")
+    
     # если «новый разбор» — мгновенно в чистый разбор
     if any(key in tl for key in ["новый разбор", "с нуля", "начать заново", "start over"]):
         st["data"].pop("mer", None)
@@ -455,9 +466,9 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
     history.append({"role": "user", "content": text_in})
     st["data"]["history"] = history
 
-    # приветствие/резюм
+    # приветствие/резюм - ВАЖНО: если вернули True, выходим из функции
     if greet_or_resume(uid, st, text_in):
-        return
+        return  # ← КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: выходим если обработали приветствие
 
     # выбор стиля
     if st["intent"] == INTENT_GREET and st["step"] == STEP_ASK_STYLE:
@@ -474,7 +485,7 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
             bot.send_message(uid, "Выбери «ты» или «вы».", reply_markup=STYLE_KB)
         return
 
-    # явный запрос «новый разбор»
+    # явный запрос «новый разбор» - ВАЖНО: добавляем return после обработки
     tl = text_in.lower()
     if any(key in tl for key in ["новый разбор", "с нуля", "начать заново", "start over"]):
         st["data"].pop("mer", None)
@@ -484,7 +495,7 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
         save_state(uid, INTENT_ERR, STEP_ERR_DESCR, st["data"])
         bot.send_message(uid, "Окей, начнём заново. Опиши последний случай: что планировал и где отступил?")
         set_awaiting(uid, st, True)
-        return
+        return  # ← КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: выходим после обработки
 
     # меню/интенты
     if st["intent"] == INTENT_ERR:
@@ -755,8 +766,12 @@ def webhook():
 # ========= Maintenance & gentle reminders =========
 def cleanup_old_states(days: int = 30):
     try:
-        db_exec("DELETE FROM user_state WHERE updated_at < NOW() - make_interval(days => :days)", {"days": days})
-        log.info("Old user states cleanup done (> %s days).", days)
+        # ИСПРАВЛЕННЫЙ ЗАПРОС - убрал make_interval
+        result = db_exec(
+            "DELETE FROM user_state WHERE updated_at < NOW() - INTERVAL '1 day' * :days", 
+            {"days": days}
+        )
+        log.info("Old user states cleanup done (> %s days). Deleted: %s", days, result.rowcount)
     except Exception as e:
         log.error("Cleanup error: %s", e)
 
@@ -764,32 +779,49 @@ def reminder_tick():
     """Каждую минуту: если ждём ответ и тишина > REMIND_AFTER_MIN — мягкий пинг (не чаще REMIND_REPEAT_MIN)."""
     while True:
         try:
+            # ИСПРАВЛЕННЫЙ ЗАПРОС - убрал make_interval, добавил безопасный LIKE
             rows = db_exec("""
                 SELECT user_id, intent, step, data
                 FROM user_state
-                WHERE data LIKE '%"awaiting_reply": true%'
-                  AND updated_at < NOW() - make_interval(minutes => :mins)
-            """, {"mins": REMIND_AFTER_MIN}).mappings().all()
+                WHERE data::text LIKE '%' || :search_term || '%'
+                  AND updated_at < NOW() - INTERVAL '1 minute' * :mins
+            """, {
+                "search_term": '"awaiting_reply": true', 
+                "mins": REMIND_AFTER_MIN
+            }).mappings().all()
+            
             now = datetime.now(timezone.utc)
+            reminder_count = 0
+            
             for r in rows:
                 try:
                     data = json.loads(r["data"]) if r["data"] else {}
                 except Exception:
                     data = {}
+                    
                 last_ping = _iso_to_dt(data.get("reminder_sent_at"))
                 if last_ping and (now - last_ping) < timedelta(minutes=REMIND_REPEAT_MIN):
                     continue
+                    
                 # отправим мягкий пинг
-                bot.send_message(r["user_id"], "Как будешь готов — продолжим. Могу повторить вопрос.")
-                data["reminder_sent_at"] = _now_iso()
-                save_state(r["user_id"], data=data)
+                try:
+                    bot.send_message(r["user_id"], "Как будешь готов — продолжим. Могу повторить вопрос.")
+                    data["reminder_sent_at"] = _now_iso()
+                    save_state(r["user_id"], data=data)
+                    reminder_count += 1
+                except Exception as e:
+                    log.error(f"Failed to send reminder to {r['user_id']}: {e}")
+                    
+            if reminder_count > 0:
+                log.info(f"Sent {reminder_count} reminders")
+                
         except Exception as e:
-            log.error("Reminder error: %s", e)
+            log.error(f"Reminder error: {e}")
         time.sleep(60)
 
 def cleanup_scheduler():
     while True:
-        time.sleep(24 * 60 * 60)
+        time.sleep(24 * 60 * 60)  # 24 hours
         cleanup_old_states(30)
 
 # ========= Init on import (for gunicorn) =========
@@ -816,6 +848,7 @@ if SET_WEBHOOK_FLAG:
 try:
     threading.Thread(target=cleanup_scheduler, daemon=True).start()
     threading.Thread(target=reminder_tick, daemon=True).start()
+    log.info("Background threads started")
 except Exception as e:
     log.error("Can't start background threads: %s", e)
 
