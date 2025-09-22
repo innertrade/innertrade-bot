@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22 (coach-struct v5-openai-0.28.1)
+# Версия: 2025-09-22 (coach-struct v6-fixed-db)
 
 import os
 import json
@@ -18,7 +18,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 import telebot
 from telebot import types
-import openai  # ← ИЗМЕНЕНО: импорт без OpenAI класса
+import openai
 
 # ========= Version =========
 def get_code_version():
@@ -81,9 +81,7 @@ MER_ORDER = [STEP_MER_CTX, STEP_MER_EMO, STEP_MER_THO, STEP_MER_BEH]
 openai_status = "disabled"
 if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
     try:
-        # ИСПРАВЛЕНО: старый стиль инициализации
         openai.api_key = OPENAI_API_KEY
-        # ИСПРАВЛЕНО: старый стиль вызова
         test_response = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": "test"}],
@@ -96,8 +94,14 @@ if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
         openai_status = f"error: {e}"
 
 # ========= DB =========
+# Исправляем URL для совместимости с SQLAlchemy 1.4
+db_url = DATABASE_URL
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+    log.info("Fixed database URL format")
+
 engine = create_engine(
-    DATABASE_URL,
+    db_url,
     poolclass=QueuePool,
     pool_size=5,
     max_overflow=10,
@@ -110,18 +114,22 @@ def db_exec(sql: str, params: Optional[Dict[str, Any]] = None):
         return conn.execute(text(sql), params or {})
 
 def init_db():
-    db_exec("""
-    CREATE TABLE IF NOT EXISTS user_state(
-        user_id BIGINT PRIMARY KEY,
-        intent TEXT,
-        step TEXT,
-        data TEXT,
-        updated_at TIMESTAMPTZ DEFAULT now()
-    );
-    """)
-    db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_updated_at ON user_state(updated_at)")
-    db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_intent_step ON user_state(intent, step)")
-    log.info("DB initialized")
+    try:
+        db_exec("""
+        CREATE TABLE IF NOT EXISTS user_state(
+            user_id BIGINT PRIMARY KEY,
+            intent TEXT,
+            step TEXT,
+            data TEXT,
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+        """)
+        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_updated_at ON user_state(updated_at)")
+        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_intent_step ON user_state(intent, step)")
+        log.info("DB initialized successfully")
+    except Exception as e:
+        log.error("DB initialization failed: %s", e)
+        raise
 
 # ========= State =========
 def load_state(uid: int) -> Dict[str, Any]:
@@ -271,7 +279,6 @@ def transcribe_voice(audio_file_path: str) -> Optional[str]:
         return None
     try:
         with open(audio_file_path, "rb") as audio_file:
-            # ИСПРАВЛЕНО: старый стиль транскрибации
             tr = openai.Audio.transcribe(
                 model="whisper-1",
                 file=audio_file,
@@ -321,14 +328,12 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
     msgs.append({"role": "user", "content": text_in})
 
     try:
-        # ИСПРАВЛЕНО: старый стиль вызова
         res = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=msgs,
             temperature=0.3,
         )
         
-        # ИСПРАВЛЕНО: обработка старого формата ответа
         raw = res["choices"][0]["message"]["content"] if res.get("choices") else "{}"
         dec = json.loads(raw)
         
