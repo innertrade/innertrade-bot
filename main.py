@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22 (coach-struct v7-final) - Direct PostgreSQL
+# Версия: 2025-09-22 (coach-struct v7-final) - psycopg3
 
 import os
 import json
@@ -8,8 +8,7 @@ import logging
 import threading
 import hashlib
 import re
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List
 from difflib import SequenceMatcher
@@ -95,18 +94,22 @@ if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
 
 # ========= DB =========
 def get_db_connection():
-    """Создаем подключение к базе данных"""
-    return psycopg2.connect(DATABASE_URL)
+    """Создаем подключение к базе данных используя psycopg3"""
+    return psycopg.connect(DATABASE_URL)
 
 def db_exec(sql: str, params: Optional[Dict[str, Any]] = None):
     """Выполняет SQL запрос и возвращает результат"""
     conn = get_db_connection()
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        with conn.cursor() as cursor:
             cursor.execute(sql, params or {})
             if sql.strip().lower().startswith('select'):
-                result = cursor.fetchall()
-                return result
+                # Получаем результаты как словари
+                columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                results = []
+                for row in cursor.fetchall():
+                    results.append(dict(zip(columns, row)))
+                return results
             else:
                 conn.commit()
                 return cursor
@@ -760,9 +763,9 @@ def reminder_tick():
             rows = db_exec("""
                 SELECT user_id, intent, step, data
                 FROM user_state
-                WHERE data::text LIKE '%%' || %s || '%%'
+                WHERE data::text LIKE %s
                   AND updated_at < NOW() - INTERVAL '1 minute' * %s
-            """, ('"awaiting_reply": true', REMIND_AFTER_MIN))
+            """, ('%"awaiting_reply": true%', REMIND_AFTER_MIN))
             
             now = datetime.now(timezone.utc)
             reminder_count = 0
