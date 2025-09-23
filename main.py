@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22 (coach-struct v7-final)
+# Версия: 2025-09-22 (coach-struct v7-final) - Direct PostgreSQL
 
 import os
 import json
@@ -8,13 +8,14 @@ import logging
 import threading
 import hashlib
 import re
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List
 from difflib import SequenceMatcher
 from functools import lru_cache
 
 from flask import Flask, request, abort, jsonify
-from sqlalchemy import create_engine, text
 import telebot
 from telebot import types
 import openai
@@ -93,17 +94,27 @@ if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
         openai_status = f"error: {e}"
 
 # ========= DB =========
-# Используем правильный формат URL для SQLAlchemy 1.4.x
-db_url = DATABASE_URL
-if db_url and db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
-    log.info("Fixed database URL format")
-
-engine = create_engine(db_url)
+def get_db_connection():
+    """Создаем подключение к базе данных"""
+    return psycopg2.connect(DATABASE_URL)
 
 def db_exec(sql: str, params: Optional[Dict[str, Any]] = None):
-    with engine.begin() as conn:
-        return conn.execute(text(sql), params or {})
+    """Выполняет SQL запрос и возвращает результат"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(sql, params or {})
+            if sql.strip().lower().startswith('select'):
+                result = cursor.fetchall()
+                return result
+            else:
+                conn.commit()
+                return cursor
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
 def init_db():
     try:
@@ -116,8 +127,8 @@ def init_db():
             updated_at TIMESTAMPTZ DEFAULT now()
         );
         """)
-        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_updated_at ON user_state(updated_at)")
-        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_intent_step ON user_state(intent, step)")
+        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_updated_at ON user_state(updated_at);")
+        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_intent_step ON user_state(intent, step);")
         log.info("DB initialized successfully")
     except Exception as e:
         log.error("DB initialization failed: %s", e)
@@ -125,7 +136,9 @@ def init_db():
 
 # ========= State =========
 def load_state(uid: int) -> Dict[str, Any]:
-    row = db_exec("SELECT intent, step, data FROM user_state WHERE user_id=:uid", {"uid": uid}).mappings().first()
+    result = db_exec("SELECT intent, step, data FROM user_state WHERE user_id=%s", (uid,))
+    row = result[0] if result else None
+    
     if row:
         data = {}
         if row["data"]:
@@ -136,6 +149,7 @@ def load_state(uid: int) -> Dict[str, Any]:
                 data = {}
         return {"user_id": uid, "intent": row["intent"] or INTENT_GREET,
                 "step": row["step"] or STEP_ASK_STYLE, "data": data}
+    
     return {"user_id": uid, "intent": INTENT_GREET, "step": STEP_ASK_STYLE,
             "data": {"history": [], "last_activity_at": _now_iso(), "awaiting_reply": False}}
 
@@ -147,12 +161,14 @@ def save_state(uid: int, intent=None, step=None, data=None) -> Dict[str, Any]:
     if data:
         new_data.update(data)
     new_data["last_activity_at"] = _now_iso()
+    
     db_exec("""
         INSERT INTO user_state (user_id, intent, step, data, updated_at)
-        VALUES (:uid, :intent, :step, :data, now())
+        VALUES (%s, %s, %s, %s, now())
         ON CONFLICT (user_id) DO UPDATE
         SET intent=EXCLUDED.intent, step=EXCLUDED.step, data=EXCLUDED.data, updated_at=now()
-    """, {"uid": uid, "intent": intent, "step": step, "data": json.dumps(new_data, ensure_ascii=False)})
+    """, (uid, intent, step, json.dumps(new_data, ensure_ascii=False)))
+    
     return {"user_id": uid, "intent": intent, "step": step, "data": new_data}
 
 # ========= Bot / Flask =========
@@ -731,10 +747,10 @@ def webhook():
 def cleanup_old_states(days: int = 30):
     try:
         result = db_exec(
-            "DELETE FROM user_state WHERE updated_at < NOW() - INTERVAL '1 day' * :days", 
-            {"days": days}
+            "DELETE FROM user_state WHERE updated_at < NOW() - INTERVAL '1 day' * %s", 
+            (days,)
         )
-        log.info("Old user states cleanup done (> %s days). Deleted: %s", days, result.rowcount)
+        log.info("Old user states cleanup done (> %s days). Deleted: %s", days, result.rowcount if hasattr(result, 'rowcount') else 'unknown')
     except Exception as e:
         log.error("Cleanup error: %s", e)
 
@@ -744,12 +760,9 @@ def reminder_tick():
             rows = db_exec("""
                 SELECT user_id, intent, step, data
                 FROM user_state
-                WHERE data::text LIKE '%' || :search_term || '%'
-                  AND updated_at < NOW() - INTERVAL '1 minute' * :mins
-            """, {
-                "search_term": '"awaiting_reply": true', 
-                "mins": REMIND_AFTER_MIN
-            }).mappings().all()
+                WHERE data::text LIKE '%%' || %s || '%%'
+                  AND updated_at < NOW() - INTERVAL '1 minute' * %s
+            """, ('"awaiting_reply": true', REMIND_AFTER_MIN))
             
             now = datetime.now(timezone.utc)
             reminder_count = 0
