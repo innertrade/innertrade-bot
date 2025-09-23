@@ -1,5 +1,5 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-22 (coach-struct v7-final) - psycopg3
+# Версия: 2025-09-22 (coach-struct v8-final)
 
 import os
 import json
@@ -8,16 +8,17 @@ import logging
 import threading
 import hashlib
 import re
-import psycopg
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List
 from difflib import SequenceMatcher
 from functools import lru_cache
 
 from flask import Flask, request, abort, jsonify
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
 import telebot
 from telebot import types
-import openai
+from openai import OpenAI  # ← Новый импорт
 
 # ========= Version =========
 def get_code_version():
@@ -78,10 +79,13 @@ MER_ORDER = [STEP_MER_CTX, STEP_MER_EMO, STEP_MER_THO, STEP_MER_BEH]
 
 # ========= OpenAI =========
 openai_status = "disabled"
+openai_client = None
+
 if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
     try:
-        openai.api_key = OPENAI_API_KEY
-        test_response = openai.ChatCompletion.create(
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        # Тестовый запрос для проверки подключения
+        test_response = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": "test"}],
             max_tokens=5
@@ -93,31 +97,17 @@ if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
         openai_status = f"error: {e}"
 
 # ========= DB =========
-def get_db_connection():
-    """Создаем подключение к базе данных используя psycopg3"""
-    return psycopg.connect(DATABASE_URL)
+# Используем правильный формат URL для SQLAlchemy 2.0
+db_url = DATABASE_URL
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+    log.info("Fixed database URL format")
+
+engine = create_engine(db_url)
 
 def db_exec(sql: str, params: Optional[Dict[str, Any]] = None):
-    """Выполняет SQL запрос и возвращает результат"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(sql, params or {})
-            if sql.strip().lower().startswith('select'):
-                # Получаем результаты как словари
-                columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                results = []
-                for row in cursor.fetchall():
-                    results.append(dict(zip(columns, row)))
-                return results
-            else:
-                conn.commit()
-                return cursor
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
+    with engine.begin() as conn:
+        return conn.execute(text(sql), params or {})
 
 def init_db():
     try:
@@ -130,8 +120,8 @@ def init_db():
             updated_at TIMESTAMPTZ DEFAULT now()
         );
         """)
-        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_updated_at ON user_state(updated_at);")
-        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_intent_step ON user_state(intent, step);")
+        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_updated_at ON user_state(updated_at)")
+        db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_intent_step ON user_state(intent, step)")
         log.info("DB initialized successfully")
     except Exception as e:
         log.error("DB initialization failed: %s", e)
@@ -139,9 +129,7 @@ def init_db():
 
 # ========= State =========
 def load_state(uid: int) -> Dict[str, Any]:
-    result = db_exec("SELECT intent, step, data FROM user_state WHERE user_id=%s", (uid,))
-    row = result[0] if result else None
-    
+    row = db_exec("SELECT intent, step, data FROM user_state WHERE user_id=:uid", {"uid": uid}).mappings().first()
     if row:
         data = {}
         if row["data"]:
@@ -152,7 +140,6 @@ def load_state(uid: int) -> Dict[str, Any]:
                 data = {}
         return {"user_id": uid, "intent": row["intent"] or INTENT_GREET,
                 "step": row["step"] or STEP_ASK_STYLE, "data": data}
-    
     return {"user_id": uid, "intent": INTENT_GREET, "step": STEP_ASK_STYLE,
             "data": {"history": [], "last_activity_at": _now_iso(), "awaiting_reply": False}}
 
@@ -164,14 +151,12 @@ def save_state(uid: int, intent=None, step=None, data=None) -> Dict[str, Any]:
     if data:
         new_data.update(data)
     new_data["last_activity_at"] = _now_iso()
-    
     db_exec("""
         INSERT INTO user_state (user_id, intent, step, data, updated_at)
-        VALUES (%s, %s, %s, %s, now())
+        VALUES (:uid, :intent, :step, :data, now())
         ON CONFLICT (user_id) DO UPDATE
         SET intent=EXCLUDED.intent, step=EXCLUDED.step, data=EXCLUDED.data, updated_at=now()
-    """, (uid, intent, step, json.dumps(new_data, ensure_ascii=False)))
-    
+    """, {"uid": uid, "intent": intent, "step": step, "data": json.dumps(new_data, ensure_ascii=False)})
     return {"user_id": uid, "intent": intent, "step": step, "data": new_data}
 
 # ========= Bot / Flask =========
@@ -285,17 +270,17 @@ def extract_problem_summary(history: List[Dict]) -> str:
 
 # ========= Voice (Whisper) =========
 def transcribe_voice(audio_file_path: str) -> Optional[str]:
-    if not OPENAI_API_KEY:
+    if not openai_client:
         log.warning("Whisper: API key not available")
         return None
     try:
         with open(audio_file_path, "rb") as audio_file:
-            tr = openai.Audio.transcribe(
+            tr = openai_client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
                 language="ru"
             )
-        return tr.get("text", None) if tr else None
+        return tr.text if tr else None
     except Exception as e:
         log.error("Whisper error: %s", e)
         return None
@@ -310,7 +295,7 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
         "is_structural": False
     }
     
-    if not OPENAI_API_KEY or not OFFSCRIPT_ENABLED:
+    if not openai_client or not OFFSCRIPT_ENABLED:
         log.warning("OpenAI not available")
         return fallback
 
@@ -339,13 +324,13 @@ def gpt_decide(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
     msgs.append({"role": "user", "content": text_in})
 
     try:
-        res = openai.ChatCompletion.create(
+        res = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=msgs,
             temperature=0.3,
         )
         
-        raw = res["choices"][0]["message"]["content"] if res.get("choices") else "{}"
+        raw = res.choices[0].message.content if res.choices else "{}"
         dec = json.loads(raw)
         
         if not isinstance(dec, dict):
@@ -750,10 +735,10 @@ def webhook():
 def cleanup_old_states(days: int = 30):
     try:
         result = db_exec(
-            "DELETE FROM user_state WHERE updated_at < NOW() - INTERVAL '1 day' * %s", 
-            (days,)
+            "DELETE FROM user_state WHERE updated_at < NOW() - INTERVAL '1 day' * :days", 
+            {"days": days}
         )
-        log.info("Old user states cleanup done (> %s days). Deleted: %s", days, result.rowcount if hasattr(result, 'rowcount') else 'unknown')
+        log.info("Old user states cleanup done (> %s days). Deleted: %s", days, result.rowcount)
     except Exception as e:
         log.error("Cleanup error: %s", e)
 
@@ -763,9 +748,12 @@ def reminder_tick():
             rows = db_exec("""
                 SELECT user_id, intent, step, data
                 FROM user_state
-                WHERE data::text LIKE %s
-                  AND updated_at < NOW() - INTERVAL '1 minute' * %s
-            """, ('%"awaiting_reply": true%', REMIND_AFTER_MIN))
+                WHERE data::text LIKE '%' || :search_term || '%'
+                  AND updated_at < NOW() - INTERVAL '1 minute' * :mins
+            """, {
+                "search_term": '"awaiting_reply": true', 
+                "mins": REMIND_AFTER_MIN
+            }).mappings().all()
             
             now = datetime.now(timezone.utc)
             reminder_count = 0
