@@ -559,7 +559,7 @@ def handle_structural(uid: int, text_in: str, st: Dict[str, Any]):
         bot.send_message(uid, "Супер. Назови 2–3 конкретных шага для ближайших 3 сделок (коротко, списком).")
         return
 
-    if st["step"] == STEP_TOTE_OPS":
+    if st["step"] == STEP_TOTE_OPS:
         tote = st["data"].get("tote", {})
         tote["ops"] = text_in
         new_data = st["data"].copy()
@@ -775,3 +775,4 @@ except Exception as e:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
