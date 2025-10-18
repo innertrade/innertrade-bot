@@ -1,9 +1,11 @@
 # main.py — Innertrade Kai Mentor Bot
-# Версия: 2025-09-24 (coach-struct v7.2)
-# Изменения против v7.1:
-# - Исправлена проверка ENV (без globals(), корректная проверка TG_WEBHOOK_SECRET -> TG_SECRET)
-# - Небольшой рефакторинг защитных проверок и логов
-# - Остальная логика сохранена без изменений (коуч-слой → подтверждение → разбор MERCEDES/TOTE, idle-напоминания)
+# Версия: 2025-10-18 (coach-logic slow v7.4)
+# Ключевые изменения vs v7.3:
+# - Медленная калибровка: порог coach_turns >= COACH_MIN_TURNS (по умолчанию 3)
+# - НЕТ форс-перехода по risk-паттернам до достижения порога
+# - Перед предложением разбора требуем "2 из 4" фактов (вход/план/где отступил/результат)
+# - Мягкие формулировки подтверждения + явная кнопка старта потока
+# - Без синтакс. ошибок; совместимо с SQLAlchemy 2.x, psycopg 3, OpenAI 1.108.x
 
 import os
 import json
@@ -32,13 +34,13 @@ def _code_hash():
     except Exception:
         return "unknown"
 
-BOT_VERSION = f"2025-09-24-{_code_hash()}"
+BOT_VERSION = f"2025-10-18-{_code_hash()}"
 
 # ========= ENV =========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 PUBLIC_URL     = os.getenv("PUBLIC_URL", "").strip()
 WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "webhook").strip()
-TG_SECRET      = os.getenv("TG_WEBHOOK_SECRET", "").strip()  # <- читаем из TG_WEBHOOK_SECRET
+TG_SECRET      = os.getenv("TG_WEBHOOK_SECRET", "").strip()
 
 DATABASE_URL   = os.getenv("DATABASE_URL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -49,22 +51,23 @@ SET_WEBHOOK_FLAG  = os.getenv("SET_WEBHOOK", "false").lower() == "true"
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_BODY          = int(os.getenv("MAX_BODY", "1000000"))
 
-# Idle/Reminder настройки
-IDLE_MINUTES_REMIND   = int(os.getenv("IDLE_MINUTES_REMIND", "60"))   # спустя сколько минут молчания предложить «продолжим?»
-IDLE_MINUTES_RESET    = int(os.getenv("IDLE_MINUTES_RESET", "240"))   # спустя сколько минут молчания предложить «продолжим/заново?»
-REMINDERS_ENABLED     = os.getenv("REMINDERS_ENABLED", "true").lower() == "true"
+# Idle / Reminders
+IDLE_MINUTES_REMIND = int(os.getenv("IDLE_MINUTES_REMIND", "60"))
+IDLE_MINUTES_RESET  = int(os.getenv("IDLE_MINUTES_RESET", "240"))
+REMINDERS_ENABLED   = os.getenv("REMINDERS_ENABLED", "true").lower() == "true"
 
-HIST_LIMIT = 16  # храним последние N реплик диалога
+# Coach-layer strictness
+COACH_MIN_TURNS = int(os.getenv("COACH_MIN_TURNS", "3"))     # минимум итераций калибровки
+REQUIRE_2OF4    = os.getenv("COACH_REQUIRE_2OF4", "true").lower() == "true"
+ALLOW_FORCE_BEFORE_THRESHOLD = os.getenv("ALLOW_FORCE_BEFORE_THRESHOLD", "false").lower() == "true"
 
-# ========= Guards (исправлено) =========
-_required_env = {
-    "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
-    "PUBLIC_URL": PUBLIC_URL,
-    "WEBHOOK_PATH": WEBHOOK_PATH,
-    "TG_WEBHOOK_SECRET": TG_SECRET,
-    "DATABASE_URL": DATABASE_URL,
-}
-_missing = [k for k, v in _required_env.items() if not v]
+HIST_LIMIT = 16
+
+# ========= Guards =========
+_missing = []
+for k in ["TELEGRAM_TOKEN", "PUBLIC_URL", "WEBHOOK_PATH", "TG_WEBHOOK_SECRET", "DATABASE_URL"]:
+    if not globals()[k]:
+        _missing.append(k)
 if _missing:
     raise RuntimeError(f"ENV variables missing: {', '.join(_missing)}")
 
@@ -73,15 +76,16 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)
 log = logging.getLogger("kai-mentor")
 log.info(f"Starting bot version: {BOT_VERSION}")
 
-# ========= Intents/Steps =========
+# ========= Intents / Steps =========
 INTENT_GREET = "greet"
 INTENT_FREE  = "free"
 INTENT_ERR   = "error"
 INTENT_DONE  = "done"
 
 STEP_ASK_STYLE  = "ask_style"
-STEP_FREE_INTRO = "free_intro"     # коуч слой до структуры
-STEP_ERR_DESCR  = "err_describe"   # описание проблемы (после подтверждения)
+STEP_FREE_INTRO = "free_intro"
+STEP_ERR_DESCR  = "err_describe"
+
 STEP_MER_CTX    = "mer_context"
 STEP_MER_EMO    = "mer_emotions"
 STEP_MER_THO    = "mer_thoughts"
@@ -99,7 +103,7 @@ openai_status = "disabled"
 if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
     try:
         oai_client = OpenAI(api_key=OPENAI_API_KEY)
-        # Быстрый «пинг» клиента
+        # быстрый пинг
         oai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": "ping"}],
@@ -212,11 +216,6 @@ def detect_trading_patterns(text: str) -> List[str]:
             hits.append(name)
     return hits
 
-def should_force_structural(text: str) -> bool:
-    pats = detect_trading_patterns(text)
-    risk = set(pats) & set(RISK_PATTERNS.keys())
-    return bool(risk) or ("fear_of_loss" in pats) or ("self_doubt" in pats)
-
 BAN_TEMPLATES = [
     "понимаю", "это может быть", "важно понять", "давай рассмотрим", "было бы полезно",
     "попробуй", "используй", "придерживайся", "установи", "сфокусируйся", "следуй", "пересмотри"
@@ -259,6 +258,26 @@ def extract_problem_summary(history: List[Dict]) -> str:
     if "self_doubt" in up: parts.append("сомнения после входа")
     return "Триггеры: " + (", ".join(parts) if parts else "нужен пример")
 
+# --- «2 из 4» фактов (вход/план/где отступил/результат)
+FACT_PATTERNS = {
+    "entry": ["вход", "зашёл", "открытие", "открыл позицию", "входил"],
+    "plan": ["план", "сетап", "сценарий", "тейк", "стоп", "риск", "таймфрейм"],
+    "deviation": ["отступил", "нарушил", "передвинул", "снял", "закрыл руками", "усреднил"],
+    "result": ["итог", "результат", "вышел в ноль", "убыток", "прибыль", "стоп сработал"],
+}
+
+def _has_any(text: str, keys: List[str]) -> bool:
+    tl = (text or "").lower()
+    return any(k in tl for k in keys)
+
+def facts_2of4(text: str) -> int:
+    score = 0
+    if _has_any(text, FACT_PATTERNS["entry"]):      score += 1
+    if _has_any(text, FACT_PATTERNS["plan"]):       score += 1
+    if _has_any(text, FACT_PATTERNS["deviation"]):  score += 1
+    if _has_any(text, FACT_PATTERNS["result"]):     score += 1
+    return score
+
 # ========= Whisper (voice) =========
 def transcribe_voice(audio_file_path: str) -> Optional[str]:
     if not oai_client:
@@ -279,16 +298,15 @@ def transcribe_voice(audio_file_path: str) -> Optional[str]:
 # ========= GPT: коуч-слой (калибровка) =========
 def gpt_coach(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Коуч-слой до структуры.
     Возвращает JSON:
       - response_text (коротко, разговорно, без советов)
       - store (dict)
-      - propose_summary (строка-резюме проблемы) ИЛИ "" если рано
-      - ask_confirm (bool) — задать «подтверди, что это именно это»
-      - suggest_struct (bool) — предложить разобрать по шагам сейчас
+      - propose_summary (строка-резюме) — может быть пустым
+      - ask_confirm (bool)
+      - suggest_struct (bool) — мы всё равно отфильтруем по порогу/2of4
     """
     fallback = {
-        "response_text": "Окей, коротко уточню: о каком последнем случае речь и что именно пошло не по плану?",
+        "response_text": "Окей, уточню буквально пару штрихов: где/когда был случай и на каком шаге ты отступил?",
         "store": {},
         "propose_summary": "",
         "ask_confirm": False,
@@ -301,13 +319,14 @@ def gpt_coach(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
     history = st["data"].get("history", [])
 
     system = f"""
-Ты — Алекс, коуч-наставник по трейдингу. Задача: вести живой диалог (на «{style}»), уточнять,
-конкретизировать проблему и мягко резюмировать. Не давай советов и списков техник.
-Не упоминай названия техник. Двигайся короткими вопросами.
-Когда проблема уже конкретна — верни краткое резюме (propose_summary) и попроси подтверждения (ask_confirm=true).
-Только после подтверждения можно предложить разобрать по шагам (suggest_struct=true).
-Формат ответа — JSON с ключами:
-response_text, store (объект), propose_summary (строка), ask_confirm (bool), suggest_struct (bool).
+Ты — Алекс, коуч-наставник по трейдингу. Работаешь на «{style}».
+Цель: живой диалог, калибровка и конкретизация проблемы короткими вопросами.
+Запрещено: советы, списки правил, упоминание названий техник.
+Алгоритм:
+1) Задавай 1 короткий вопрос за ход (где/когда/что именно пошло не так/что почувствовал).
+2) Когда конкретики достаточно, верни краткое резюме в propose_summary и предложи подтвердить (ask_confirm=true).
+3) suggest_struct указывай true только если человек явно говорит «готов/давай разберём по шагам» — иначе false.
+Формат ответа — JSON с ключами: response_text, store, propose_summary, ask_confirm, suggest_struct.
 """.strip()
 
     msgs = [{"role": "system", "content": system}]
@@ -325,15 +344,12 @@ response_text, store (объект), propose_summary (строка), ask_confirm
         )
         raw = res.choices[0].message.content or "{}"
         dec = json.loads(raw)
-
         for k in ["response_text", "store", "propose_summary", "ask_confirm", "suggest_struct"]:
             if k not in dec:
                 return fallback
-
         resp = strip_templates(anti_echo(text_in, dec.get("response_text", "")))
         if len(resp) < 8:
-            resp = "Давай чуть конкретнее: какой кейс имеешь в виду и где именно отступил от плана?"
-
+            resp = "Давай конкретизируем: где это было и на каком шаге ты отступил (вход/стоп/выход)?"
         dec["response_text"] = resp
         return dec
     except Exception as e:
@@ -358,12 +374,11 @@ def offer_structural(uid: int, st: Dict[str, Any]):
 def cmd_start(m: types.Message):
     uid = m.from_user.id
     st = load_state(uid)
-
+    # сброс приветствия
     if st["intent"] == INTENT_GREET and st["step"] == STEP_ASK_STYLE:
         pass
     else:
         st = save_state(uid, INTENT_GREET, STEP_ASK_STYLE, {"history": []})
-
     bot.send_message(uid,
         "👋 Привет! Как удобнее — <b>ты</b> или <b>вы</b>?\n\n"
         "Если захочешь начать с чистого листа — напиши: <b>новый разбор</b>.",
@@ -376,7 +391,8 @@ def cmd_version(m: types.Message):
         f"🔄 Версия бота: {BOT_VERSION}\n"
         f"📝 Хэш кода: {_code_hash()}\n"
         f"🕒 Время сервера: {datetime.now(timezone.utc).isoformat()}\n"
-        f"🤖 OpenAI: {openai_status}"
+        f"🤖 OpenAI: {openai_status}\n"
+        f"⚙️ Калибровка: min={COACH_MIN_TURNS}, 2of4={REQUIRE_2OF4}, force_before_threshold={ALLOW_FORCE_BEFORE_THRESHOLD}"
     )
     bot.reply_to(m, info)
 
@@ -429,7 +445,7 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
 
     # reset по ключевому слову
     if text_in.lower().strip() in ("новый разбор", "новый", "с чистого листа", "start over"):
-        st = save_state(uid, INTENT_FREE, STEP_FREE_INTRO, {"history": [], "struct_offer_shown": False})
+        st = save_state(uid, INTENT_FREE, STEP_FREE_INTRO, {"history": [], "struct_offer_shown": False, "coach_turns": 0})
         bot.send_message(uid, "Окей, начнём с чистого листа. Расскажи коротко, что хочется поправить сейчас?", reply_markup=MAIN_MENU)
         return
 
@@ -440,10 +456,11 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
 
     # Greeting: выбор стиля
     if st["intent"] == INTENT_GREET and st["step"] == STEP_ASK_STYLE:
-        if text_in.lower() in ("ты", "вы"):
-            st["data"]["style"] = text_in.lower()
+        choice = text_in.lower()
+        if choice in ("ты", "вы"):
+            st["data"]["style"] = choice
             st = save_state(uid, INTENT_FREE, STEP_FREE_INTRO, st["data"])
-            bot.send_message(uid, f"Принято ({text_in}). С чего начнём? Что сейчас в трейдинге хочется поправить?", reply_markup=MAIN_MENU)
+            bot.send_message(uid, f"Принято ({choice}). С чего начнём? Что сейчас в трейдинге хочется поправить?", reply_markup=MAIN_MENU)
         else:
             save_state(uid, data=st["data"])
             bot.send_message(uid, "Выбери «ты» или «вы».", reply_markup=STYLE_KB)
@@ -455,49 +472,63 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
         return
 
     # ===== Коуч-слой (до структуры) =====
-    st_data = st["data"]
-    coach_turns = int(st_data.get("coach_turns", 0))
+    data = st["data"]
+    coach_turns = int(data.get("coach_turns", 0))
 
     decision = gpt_coach(uid, text_in, st)
     resp = decision.get("response_text") or "Окей. Коротко уточню: где именно ты отступил от плана (вход/стоп/выход)?"
 
-    st_data = _append_history(st_data, "assistant", resp)
+    data = _append_history(data, "assistant", resp)
     if decision.get("store"):
         try:
-            st_data.update(decision["store"])
+            data.update(decision["store"])
         except Exception:
             pass
 
     if decision.get("propose_summary"):
-        st_data["problem_draft"] = decision["propose_summary"]
+        data["problem_draft"] = decision["propose_summary"]
 
+    # Механика подтверждения
     ask_confirm = bool(decision.get("ask_confirm", False))
-    suggest_struct = bool(decision.get("suggest_struct", False))
+    # НЕ доверяем suggest_struct напрямую — решаем сами
+    suggest_struct = False
+
     coach_turns += 1
-    st_data["coach_turns"] = coach_turns
+    data["coach_turns"] = coach_turns
 
-    ready_for_struct = False
-    if st_data.get("problem_confirmed"):
-        ready_for_struct = True
-    elif suggest_struct and (coach_turns >= 2 or should_force_structural(text_in)):
-        ask_confirm = True
+    # Требуем «2 из 4» фактов в совокупности истории (последнее сообщение — как минимум)
+    # Берём последние 4 сообщения пользователя для оценки
+    recent_user = [h["content"] for h in data.get("history", []) if h.get("role") == "user"][-4:]
+    facts_score = max([facts_2of4(t) for t in recent_user] + [facts_2of4(text_in)])
 
-    st = save_state(uid, INTENT_FREE, STEP_FREE_INTRO, st_data)
+    # До достижения порога не форсим структуру, даже если явные risk-паттерны
+    risk_seen = detect_trading_patterns(text_in)
+    force_allowed = ALLOW_FORCE_BEFORE_THRESHOLD and any(r in RISK_PATTERNS for r in risk_seen)
 
+    ready_by_turns = (coach_turns >= COACH_MIN_TURNS)
+    ready_by_facts = (facts_score >= 2) if REQUIRE_2OF4 else True
+
+    ready_for_struct = bool(data.get("problem_confirmed")) or ((ready_by_turns or force_allowed) and ready_by_facts)
+
+    st = save_state(uid, INTENT_FREE, STEP_FREE_INTRO, data)
+
+    # Отправляем ответ
     if original_message:
         bot.reply_to(original_message, resp, reply_markup=MAIN_MENU)
     else:
         bot.send_message(uid, resp, reply_markup=MAIN_MENU)
 
-    if ask_confirm and st_data.get("problem_draft"):
+    # Если модель попросила — спросим подтверждение резюме (и у нас что-то есть)
+    if ask_confirm and data.get("problem_draft"):
         kb = types.InlineKeyboardMarkup().row(
             types.InlineKeyboardButton("Да, это оно", callback_data="confirm_problem"),
             types.InlineKeyboardButton("Нет, переформулировать", callback_data="refine_problem"),
         )
-        bot.send_message(uid, f"Суммирую твоими словами:\n\n<b>{st_data['problem_draft']}</b>\n\nПодходит?", reply_markup=kb)
+        bot.send_message(uid, f"Суммирую твоими словами:\n\n<b>{data['problem_draft']}</b>\n\nПодходит?", reply_markup=kb)
         return
 
-    if ready_for_struct:
+    # Если подтверждено ранее или достигнут порог и факты ок — предложим структуру
+    if ready_for_struct and not st["data"].get("struct_offer_shown"):
         offer_structural(uid, st)
 
 # ========= Structural Flow =========
@@ -577,9 +608,9 @@ def proceed_struct(uid: int, text_in: str, st: Dict[str, Any]):
         bot.send_message(uid, "Готов вынести это в «фокус недели» или идём дальше?", reply_markup=MAIN_MENU)
         return
 
-    # fallback — вернёмся в коуч-слой
+    # fallback — назад к коуч-слою
     save_state(uid, INTENT_FREE, STEP_FREE_INTRO, data)
-    bot.send_message(uid, "Окей, вернёмся на шаг назад и уточним ещё чуть-чуть.", reply_markup=MAIN_MENU)
+    bot.send_message(uid, "Окей, шаг назад — ещё чуть конкретики и продолжим.", reply_markup=MAIN_MENU)
 
 # ========= Menu handlers =========
 MENU_BTNS = {
@@ -627,6 +658,7 @@ def on_callback(call: types.CallbackQuery):
         st["data"]["problem"] = st["data"].get("problem_draft", "—")
         st["data"]["problem_confirmed"] = True
         st["data"]["struct_offer_shown"] = False
+        st["data"]["coach_turns"] = max(int(st["data"].get("coach_turns", 0)), COACH_MIN_TURNS)  # чтобы сразу можно было предложить
         save_state(uid, INTENT_FREE, STEP_FREE_INTRO, st["data"])
         bot.send_message(uid, "Принято. Готов разобрать это по шагам?", reply_markup=types.InlineKeyboardMarkup().row(
             types.InlineKeyboardButton("Разобрать по шагам", callback_data="start_error_flow"),
@@ -642,11 +674,10 @@ def on_callback(call: types.CallbackQuery):
 
     if data == "start_error_flow":
         st["data"]["problem_confirmed"] = True
+        st = save_state(uid, INTENT_ERR, STEP_ERR_DESCR, st["data"])
         if st["data"].get("problem"):
-            st = save_state(uid, INTENT_ERR, STEP_ERR_DESCR, st["data"])
             bot.send_message(uid, "Начинаем разбор. Опиши последний случай: вход/план, где отступил, результат.")
         else:
-            st = save_state(uid, INTENT_ERR, STEP_ERR_DESCR, st["data"])
             bot.send_message(uid, "Опиши последний кейс ошибки: где/когда, вход/стоп/план, где отступил, чем закончилось.")
         return
 
@@ -662,7 +693,7 @@ def on_callback(call: types.CallbackQuery):
         return
 
     if data == "restart_session":
-        st = save_state(uid, INTENT_FREE, STEP_FREE_INTRO, {"history": [], "struct_offer_shown": False})
+        st = save_state(uid, INTENT_FREE, STEP_FREE_INTRO, {"history": [], "struct_offer_shown": False, "coach_turns": 0})
         bot.send_message(uid, "Окей, начнём заново. Что сейчас хочется поправить?", reply_markup=MAIN_MENU)
         return
 
