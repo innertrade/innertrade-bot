@@ -61,7 +61,7 @@ HIST_LIMIT = 16  # последние N реплик
 
 # ========= Guards =========
 missing_env = []
-for k in ["TELEGRAM_TOKEN", "PUBLIC_URL", "WEBHOOK_PATH", "TG_WEBHOOK_SECRET", "DATABASE_URL"]:
+for k in ["TELEGRAM_TOKEN", "PUBLIC_URL", "WEBHOOK_PATH", "DATABASE_URL", "TG_SECRET"]:
     if not globals()[k]:
         missing_env.append(k)
 if missing_env:
@@ -801,3 +801,4 @@ except Exception as e:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
