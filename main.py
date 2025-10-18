@@ -1,8 +1,6 @@
-# main.py — Innertrade Kai Mentor Bot (v8 Orchestrated)
+# main.py — Innertrade Kai Mentor Bot (v8.0.1 Orchestrated)
 # Дата: 2025-10-18
-# Идея: GPT-оркестратор решает, когда калибровать/подтверждать/предлагать разбор,
-# какие подшаги MERCEDES/TOTE спрашивать. Код лишь показывает ответы, запоминает данные
-# и выполняет переходы ТОЛЬКО по согласованию пользователя.
+# Изм.: TG_WEBHOOK_SECRET обязателен только при SET_WEBHOOK=true
 
 import os
 import json
@@ -22,7 +20,6 @@ import telebot
 from telebot import types
 from openai import OpenAI
 
-# ========= Version =========
 def _code_hash():
     try:
         with open(__file__, 'rb') as f:
@@ -32,7 +29,6 @@ def _code_hash():
 
 BOT_VERSION = f"2025-10-18-{_code_hash()}"
 
-# ========= ENV =========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 PUBLIC_URL     = os.getenv("PUBLIC_URL", "").strip()
 WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH", "webhook").strip()
@@ -47,35 +43,34 @@ SET_WEBHOOK_FLAG  = os.getenv("SET_WEBHOOK", "false").lower() == "true"
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_BODY          = int(os.getenv("MAX_BODY", "1000000"))
 
-# Напоминалки
 IDLE_MINUTES_REMIND   = int(os.getenv("IDLE_MINUTES_REMIND", "60"))
 IDLE_MINUTES_RESET    = int(os.getenv("IDLE_MINUTES_RESET", "240"))
 REMINDERS_ENABLED     = os.getenv("REMINDERS_ENABLED", "true").lower() == "true"
 
-HIST_LIMIT = 16  # сколько реплик храним в истории
+HIST_LIMIT = 16
 
-# ========= Guards =========
+# ========= Guards (секрет обязателен только если ставим вебхук) =========
 missing_env = []
-for k in ["TELEGRAM_TOKEN", "PUBLIC_URL", "WEBHOOK_PATH", "TG_WEBHOOK_SECRET", "DATABASE_URL"]:
-    if not globals().get(k):
+for k in ["TELEGRAM_TOKEN", "PUBLIC_URL", "WEBHOOK_PATH", "DATABASE_URL"]:
+    if not os.getenv(k, "").strip():
         missing_env.append(k)
+if SET_WEBHOOK_FLAG and not TG_SECRET:
+    missing_env.append("TG_WEBHOOK_SECRET")
 if missing_env:
     raise RuntimeError(f"ENV variables missing: {', '.join(missing_env)}")
 
-# ========= Logging =========
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("kai-mentor")
 log.info(f"Starting bot version: {BOT_VERSION}")
 
-# ========= Intents/Steps =========
 INTENT_GREET = "greet"
-INTENT_FREE  = "free"    # свободный коуч-слой (до структуры)
-INTENT_ERR   = "error"   # разбор (структура)
-INTENT_DONE  = "done"    # финал
+INTENT_FREE  = "free"
+INTENT_ERR   = "error"
+INTENT_DONE  = "done"
 
 STEP_ASK_STYLE  = "ask_style"
-STEP_FREE_INTRO = "free_intro"     # калибровка до структуры
-STEP_ERR_DESCR  = "err_describe"   # «опиши последний кейс»
+STEP_FREE_INTRO = "free_intro"
+STEP_ERR_DESCR  = "err_describe"
 STEP_MER_CTX    = "mer_context"
 STEP_MER_EMO    = "mer_emotions"
 STEP_MER_THO    = "mer_thoughts"
@@ -87,13 +82,11 @@ STEP_TOTE_EXIT  = "tote_exit"
 
 MER_ORDER = [STEP_MER_CTX, STEP_MER_EMO, STEP_MER_THO, STEP_MER_BEH]
 
-# ========= OpenAI =========
 oai_client = None
 openai_status = "disabled"
 if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
     try:
         oai_client = OpenAI(api_key=OPENAI_API_KEY)
-        # быстрый «пинг» (маленький запрос)
         oai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": "ping"}],
@@ -106,7 +99,6 @@ if OPENAI_API_KEY and OFFSCRIPT_ENABLED:
         oai_client = None
         openai_status = f"error: {e}"
 
-# ========= DB =========
 engine = create_engine(
     DATABASE_URL,
     poolclass=QueuePool,
@@ -134,7 +126,6 @@ def init_db():
     db_exec("CREATE INDEX IF NOT EXISTS idx_user_state_intent_step ON user_state(intent, step)")
     log.info("DB initialized")
 
-# ========= State =========
 def load_state(uid: int) -> Dict[str, Any]:
     row = db_exec("SELECT intent, step, data FROM user_state WHERE user_id=:uid", {"uid": uid}).mappings().first()
     if row:
@@ -147,12 +138,7 @@ def load_state(uid: int) -> Dict[str, Any]:
                 data = {}
         if "history" not in data:
             data["history"] = []
-        return {
-            "user_id": uid,
-            "intent": row["intent"] or INTENT_GREET,
-            "step": row["step"] or STEP_ASK_STYLE,
-            "data": data
-        }
+        return {"user_id": uid, "intent": row["intent"] or INTENT_GREET, "step": row["step"] or STEP_ASK_STYLE, "data": data}
     return {"user_id": uid, "intent": INTENT_GREET, "step": STEP_ASK_STYLE, "data": {"history": []}}
 
 def save_state(uid: int, intent=None, step=None, data=None) -> Dict[str, Any]:
@@ -171,9 +157,8 @@ def save_state(uid: int, intent=None, step=None, data=None) -> Dict[str, Any]:
     """, {"uid": uid, "intent": intent, "step": step, "data": json.dumps(new_data, ensure_ascii=False)})
     return {"user_id": uid, "intent": intent, "step": step, "data": new_data}
 
-# ========= Bot / Flask =========
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML", threaded=False)
-app = Flask(__name__)  # ВАЖНО: app существует для gunicorn main:app
+app = Flask(__name__)
 
 MAIN_MENU = types.ReplyKeyboardMarkup(resize_keyboard=True)
 MAIN_MENU.row("🚑 У меня ошибка", "🧩 Хочу стратегию")
@@ -183,7 +168,6 @@ MAIN_MENU.row("🆘 Экстренно", "🤔 Не знаю, с чего нач
 STYLE_KB = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
 STYLE_KB.row("ты", "вы")
 
-# ========= Helpers =========
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -203,20 +187,7 @@ def mer_prompt_for(step: str) -> str:
         STEP_MER_BEH: "Что сделал фактически? Действия.",
     }.get(step, "Продолжим.")
 
-# ========= GPT Orchestrator =========
 def gpt_orchestrator(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Возвращает JSON-решение для следующего шага:
-    {
-      reply: str,
-      phase: "calibrate|need_more|problem_hypothesis|ask_confirm|ready_for_mercedes|in_mercedes|ready_for_tote|in_tote|wrap_up",
-      summary_draft: str,
-      mercedes: { next_step: "ctx|emo|thoughts|behavior|null", allow_backtrack: true },
-      tote: { next_step: "ops|test|exit|null" },
-      buttons: [..],
-      require_user_confirm: bool
-    }
-    """
     fallback = {
         "reply": "Понял. Давай сфокусируем картинку: где/когда это было и в какой момент понял, что отклоняешься от плана?",
         "phase": "calibrate",
@@ -230,25 +201,15 @@ def gpt_orchestrator(uid: int, text_in: str, st: Dict[str, Any]) -> Dict[str, An
         return fallback
 
     style = st["data"].get("style", "ты")
-    mer = st["data"].get("mer", {})
-    tote = st["data"].get("tote", {})
     history = st["data"].get("history", [])
 
     system = f"""
-Ты — Алекс, коуч-наставник по трейдингу (тон тёплый, естественный, на «{style}»).
-У тебя три фазы работы: калибровка → структурный разбор (без названий техник) → короткий план (3 сделки).
-Задачи:
-- Пока проблема не конкретна → phase: calibrate или need_more. Дай 1 строку валидирующего отражения + 1–2 чётких вопроса.
-- Когда увидишь конкретику → сформулируй короткий черновик в "summary_draft" и поставь phase: problem_hypothesis.
-- Если пора спросить подтверждение формулировки → phase: ask_confirm и require_user_confirm=true.
-- После подтверждения → phase: ready_for_mercedes и предложи кнопки (например, ["Разобрать по шагам","Пока нет"]).
-- В разборе → phase: in_mercedes и mercedes.next_step ∈ {{ctx, emo, thoughts, behavior}}. Названия техник НЕ упоминай.
-  Можно предложить шаг назад (allow_backtrack=true), если по смыслу рано.
-- Когда блок «карта переживания и действий» собран достаточно → phase: ready_for_tote (по согласию).
-- В плане на 3 сделки → phase: in_tote и tote.next_step ∈ {{ops, test, exit}}. Можно вернуть в in_mercedes, если всплыла новая деталь.
-- Завершение → phase: wrap_up (суммаризируй, мягко предложи «в фокус недели»).
-Говори кратко, по-человечески, без лекций и названий техник. Ответ верни в JSON с ключами:
-reply, phase, summary_draft, mercedes{{next_step,allow_backtrack}}, tote{{next_step}}, buttons, require_user_confirm.
+Ты — Алекс, коуч-наставник (на «{style}»). Фазы: калибровка → структурный разбор → план 3 сделки.
+Пока проблема не конкретна — задавай 1–2 уточняющих вопроса (без лекций).
+Когда есть конкретика — дай краткий черновик summary_draft и спроси подтверждение (phase: ask_confirm).
+После подтверждения — предложи перейти к разбору (phase: ready_for_mercedes).
+В разборе по шагам не называй техники. Когда карты достаточно — предложи план на 3 сделки (phase: ready_for_tote).
+Ответ в JSON: reply, phase, summary_draft, mercedes{{next_step,allow_backtrack}}, tote{{next_step}}, buttons, require_user_confirm.
 """.strip()
 
     msgs = [{"role": "system", "content": system}]
@@ -265,33 +226,15 @@ reply, phase, summary_draft, mercedes{{next_step,allow_backtrack}}, tote{{next_s
             response_format={"type": "json_object"},
         )
         dec = json.loads(res.choices[0].message.content or "{}")
-        # sanity-keys
         for k in ["reply","phase","summary_draft","mercedes","tote","buttons","require_user_confirm"]:
             if k not in dec:
                 return fallback
-        # лёгкая санитарка
         dec["reply"] = re.sub(r'\s+', ' ', (dec.get("reply") or "")).strip()
         return dec
     except Exception as e:
         log.error("gpt_orchestrator error: %s", e)
         return fallback
 
-# ========= Offer helpers =========
-def offer_mercedes(uid: int):
-    kb = types.InlineKeyboardMarkup().row(
-        types.InlineKeyboardButton("Разобрать по шагам", callback_data="start_error_flow"),
-        types.inline_keyboard.InlineKeyboardButton("Пока нет", callback_data="skip_error_flow")
-    )
-
-# (исправление: telebot не имеет types.inline_keyboard — оставим универсальный помощник)
-def offer_yes_no(uid: int, yes_text: str, yes_cb: str, no_text: str, no_cb: str, head: str):
-    kb = types.InlineKeyboardMarkup().row(
-        types.InlineKeyboardButton(yes_text, callback_data=yes_cb),
-        types.InlineKeyboardButton(no_text, callback_data=no_cb),
-    )
-    bot.send_message(uid, head, reply_markup=kb)
-
-# ========= Handlers =========
 @bot.message_handler(commands=["start", "reset"])
 def cmd_start(m: types.Message):
     uid = m.from_user.id
@@ -325,18 +268,15 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
     txt = (text_in or "").strip()
     log.info("User %s: intent=%s step=%s text='%s'", uid, st["intent"], st["step"], txt[:200])
 
-    # reset
     if txt.lower() in ("новый разбор", "новый", "с чистого листа", "start over"):
         st = save_state(uid, INTENT_FREE, STEP_FREE_INTRO, {"history": [], "struct_offer_shown": False})
         bot.send_message(uid, "Окей, начнём с чистого листа. Расскажи коротко, что хочется поправить сейчас?", reply_markup=MAIN_MENU)
         return
 
-    # history (user)
     st["data"] = _append_history(st["data"], "user", txt)
     st["data"]["last_user_msg_at"] = _now_iso()
     st["data"]["awaiting_reply"] = True
 
-    # стиль общения
     if st["intent"] == INTENT_GREET and st["step"] == STEP_ASK_STYLE:
         if txt.lower() in ("ты", "вы"):
             st["data"]["style"] = txt.lower()
@@ -347,21 +287,17 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
             bot.send_message(uid, "Выбери «ты» или «вы».", reply_markup=STYLE_KB)
         return
 
-    # Если уже в структуре — не трогаем оркестратора, ведём по шагам
     if st["intent"] == INTENT_ERR:
         proceed_struct(uid, txt, st)
         return
 
-    # ===== GPT Orchestrator (свободная фаза) =====
     decision = gpt_orchestrator(uid, txt, st)
     reply = decision.get("reply") or "Понял. Скажи ещё, где именно отступил от плана — вход, стоп или выход?"
     phase = decision.get("phase", "calibrate")
 
-    # сохраняем черновик проблемы
     if decision.get("summary_draft"):
         st["data"]["problem_draft"] = decision["summary_draft"]
 
-    # ответ пользователю
     st["data"] = _append_history(st["data"], "assistant", reply)
     save_state(uid, INTENT_FREE, STEP_FREE_INTRO, st["data"])
     if original_message:
@@ -369,7 +305,6 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
     else:
         bot.send_message(uid, reply, reply_markup=MAIN_MENU)
 
-    # реакции на фазы
     if phase == "ask_confirm" and st["data"].get("problem_draft"):
         kb = types.InlineKeyboardMarkup().row(
             types.InlineKeyboardButton("Да, это оно", callback_data="confirm_problem"),
@@ -403,11 +338,9 @@ def handle_text_message(uid: int, text_in: str, original_message=None):
         return
 
     if phase == "wrap_up":
-        # Можно попросить итог, но финал обычно будет после структурного потока
         bot.send_message(uid, "Если нужно — подведу итог и вынесу в «фокус недели».", reply_markup=MAIN_MENU)
         return
 
-# ========= Structural Flow (после согласия) =========
 def proceed_struct(uid: int, text_in: str, st: Dict[str, Any]):
     step = st["step"]
     data = st["data"].copy()
@@ -477,11 +410,9 @@ def proceed_struct(uid: int, text_in: str, st: Dict[str, Any]):
         bot.send_message(uid, "Готов вынести это в «фокус недели» или идём дальше?", reply_markup=MAIN_MENU)
         return
 
-    # fallback — вернуться к калибровке
     save_state(uid, INTENT_FREE, STEP_FREE_INTRO, data)
     bot.send_message(uid, "Окей, вернёмся на шаг назад и уточним ещё чуть-чуть.", reply_markup=MAIN_MENU)
 
-# ========= Menu handlers =========
 MENU_BTNS = {
     "🚑 У меня ошибка": "error",
     "🧩 Хочу стратегию": "strategy",
@@ -514,7 +445,6 @@ def handle_menu(m: types.Message):
         bot.send_message(uid, "Ок. Если хочешь ускориться — нажми «🚑 У меня ошибка».", reply_markup=MAIN_MENU)
         save_state(uid, data=st["data"])
 
-# ========= Callback handlers =========
 @bot.callback_query_handler(func=lambda call: True)
 def on_callback(call: types.CallbackQuery):
     uid = call.from_user.id
@@ -543,7 +473,6 @@ def on_callback(call: types.CallbackQuery):
 
     if data == "start_error_flow":
         st["data"]["problem_confirmed"] = True
-        # перед входом в MERCEDES спросим «последний кейс» (как первый шаг структуры)
         st = save_state(uid, INTENT_ERR, STEP_ERR_DESCR, st["data"])
         bot.send_message(uid, "Начинаем разбор. Опиши последний случай: вход/план, где отступил, результат.")
         return
@@ -553,13 +482,11 @@ def on_callback(call: types.CallbackQuery):
         return
 
     if data == "start_tote":
-        # переходим к цели, затем к шагам на 3 сделки
         st = save_state(uid, INTENT_ERR, STEP_GOAL, st["data"])
         bot.send_message(uid, "Сформулируй позитивную цель: что будешь делать вместо прежнего поведения?", reply_markup=MAIN_MENU)
         return
 
     if data == "back_to_mercedes":
-        # вернуться к MERCEDES — начнём с контекста
         st = save_state(uid, INTENT_ERR, STEP_MER_CTX, st["data"])
         bot.send_message(uid, mer_prompt_for(STEP_MER_CTX), reply_markup=MAIN_MENU)
         return
@@ -576,7 +503,6 @@ def on_callback(call: types.CallbackQuery):
         bot.send_message(uid, "Окей, начнём заново. Что сейчас хочется поправить?", reply_markup=MAIN_MENU)
         return
 
-# ========= HTTP endpoints =========
 @app.get("/")
 def root():
     return jsonify({"ok": True, "time": _now_iso()})
@@ -587,8 +513,10 @@ def version_api():
 
 @app.post(f"/{WEBHOOK_PATH}")
 def webhook():
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_SECRET:
-        abort(401)
+    # При отсутствии TG_SECRET (если SET_WEBHOOK=false) — не проверяем заголовок
+    if SET_WEBHOOK_FLAG:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TG_SECRET:
+            abort(401)
     if request.content_length and request.content_length > MAX_BODY:
         abort(413, description="Body too large")
     body = request.get_data()
@@ -605,7 +533,6 @@ def webhook():
         log.error("Webhook processing error: %s", e)
         abort(500)
 
-# ========= Maintenance / Reminders =========
 def cleanup_old_states(days: int = 30):
     try:
         days = int(days)
@@ -672,7 +599,6 @@ def background_housekeeping():
             cleanup_old_states(30)
             last_cleanup = time.time()
 
-# ========= Init on import =========
 try:
     init_db()
     log.info("DB initialized (import)")
@@ -685,7 +611,7 @@ if SET_WEBHOOK_FLAG:
         time.sleep(1)
         bot.set_webhook(
             url=f"{PUBLIC_URL}/{WEBHOOK_PATH}",
-            secret_token=TG_SECRET,
+            secret_token=TG_SECRET,  # здесь секрет обязателен, но мы это уже проверили в Guards
             allowed_updates=["message", "callback_query"]
         )
         log.info("Webhook set to %s/%s", PUBLIC_URL, WEBHOOK_PATH)
@@ -698,7 +624,6 @@ try:
 except Exception as e:
     log.error("Can't start housekeeping thread: %s", e)
 
-# ========= Dev run =========
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
